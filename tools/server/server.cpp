@@ -12,6 +12,8 @@
 #include "llama.h"
 #include "log.h"
 
+#include "../../src/llama-ext.h"
+
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -196,6 +198,40 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
     // struct that contains llama context and inference
     server_context ctx_server;
+
+    if (params.measure_only) {
+        llama_model_params mparams = common_model_params_to_llama(params);
+        mparams.no_alloc  = true;
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE; // measuring only: no mmap/mlock
+
+        llama_model_ptr model{llama_model_load_from_file(params.model.path.c_str(), mparams)};
+        if (!model) {
+            LOG_ERR("%s: failed to load model for measurement\n", __func__);
+            llama_backend_free();
+            return 1;
+        }
+
+        llama_context_params cparams = common_context_params_to_llama(params);
+        llama_context_ptr ctx{llama_init_from_model(model.get(), cparams)};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create context for measurement\n", __func__);
+            llama_backend_free();
+            return 1;
+        }
+
+        common_log_pause(common_log_main());
+        for (const auto & [buft, data] : llama_get_memory_breakdown(ctx.get())) {
+            size_t total = data.total();
+            if (total > 0) {
+                fprintf(stdout, "measure:%s %zu\n", ggml_backend_buft_name(buft), total);
+            }
+        }
+        fflush(stdout);
+        common_log_resume(common_log_main());
+
+        llama_backend_free();
+        return 0;
+    }
 
     //
     // Router

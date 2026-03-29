@@ -11,6 +11,8 @@
 #include <condition_variable>
 #include <thread>
 #include <functional>
+#include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -70,6 +72,9 @@ static std::string server_model_source_to_string(server_model_source source) {
     }
 }
 
+// bytes a model needs per backend buffer type, as measured by a --measure-only child
+using buft_memory_map = std::map<ggml_backend_buffer_type_t, size_t>;
+
 struct server_model_meta {
     server_model_source source = SERVER_MODEL_SOURCE_CACHE;
     common_preset preset;
@@ -87,6 +92,7 @@ struct server_model_meta {
     mtmd_caps multimodal; // multimodal capabilities
     bool hidden = false; // hidden from GET /models, but still accept if requested
     std::string arch; // general.architecture, lazily populated by server_models::resolve_model_arch()
+    buft_memory_map bmm_req; // measured once, on first load, when --models-memory-margin is set
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -219,6 +225,11 @@ private:
     // queue of requests waiting for a models_max slot
     std::unique_ptr<server_lru_sched> sched;
 
+    // --models-memory-margin: memory each device may still hand out, measured at startup
+    buft_memory_map bmm_available;
+    // buft name -> buft, for parsing measure output (host buffer types map to the CPU buft)
+    std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_by_name;
+
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
 
@@ -226,6 +237,16 @@ private:
 
     // unload least recently used models if the limit is reached
     void unload_lru();
+
+    // number of buffer types that would exceed their memory budget if bmm_req were loaded
+    // on top of every running model; 0 means it fits. caller must hold mutex
+    int count_over_budget(const buft_memory_map & bmm_req) const;
+
+    // evict idle LRU models until bmm_req fits the memory budget, or nothing idle is left
+    void unload_for_memory(const std::string & name, const buft_memory_map & bmm_req);
+
+    // spawn a --measure-only child for the model; empty on failure. caller must NOT hold mutex
+    buft_memory_map estimate_model_memory(const std::string & name);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);

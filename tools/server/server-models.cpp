@@ -472,6 +472,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_API_KEY");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
+    preset.unset_option("LLAMA_ARG_MODELS_MEMORY_MARGIN");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     if (unset_model_args) {
@@ -593,6 +594,33 @@ server_models::server_models(
         LOG_WRN("failed to get server executable path: %s\n", e.what());
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
+    const size_t memory_margin = (size_t) base_params.models_memory_margin * 1024 * 1024;
+    if (memory_margin > 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_buffer_type_t cpu_buft = cpu_dev ? ggml_backend_dev_buffer_type(cpu_dev) : nullptr;
+
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+            if (dev_buft) {
+                buft_by_name[ggml_backend_buft_name(dev_buft)] = dev_buft;
+            }
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft && cpu_buft) {
+                buft_by_name[ggml_backend_buft_name(host_buft)] = cpu_buft;
+            }
+
+            size_t free, total;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (total > 0 && dev_buft) {
+                const size_t available = free > memory_margin ? free - memory_margin : 0;
+                bmm_available[dev_buft] = available;
+                SRV_INF("memory budget for %s: %zu MiB after a %d MiB margin\n",
+                        ggml_backend_buft_name(dev_buft), available / (1024 * 1024), base_params.models_memory_margin);
+            }
+        }
+    }
+
     load_models();
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
@@ -1098,6 +1126,107 @@ void server_models::unload_lru() {
     }
 }
 
+int server_models::count_over_budget(const buft_memory_map & bmm_req) const {
+    buft_memory_map bmm_used;
+    for (const auto & m : mapping) {
+        if (m.second.meta.is_running()) {
+            for (const auto & [buft, mem] : m.second.meta.bmm_req) {
+                bmm_used[buft] += mem;
+            }
+        }
+    }
+    int n_over = 0;
+    for (const auto & [buft, limit] : bmm_available) {
+        auto u = bmm_used.find(buft);
+        auto r = bmm_req.find(buft);
+        const size_t used = u != bmm_used.end() ? u->second : 0;
+        const size_t req  = r != bmm_req.end()  ? r->second : 0;
+        if (used + req > limit) {
+            SRV_DBG("buft %s over budget: used=%zu MiB + new=%zu MiB > %zu MiB\n", ggml_backend_buft_name(buft),
+                    used / (1024 * 1024), req / (1024 * 1024), limit / (1024 * 1024));
+            n_over++;
+        }
+    }
+    return n_over;
+}
+
+void server_models::unload_for_memory(const std::string & name, const buft_memory_map & bmm_req) {
+    while (true) {
+        std::string victim;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            if (count_over_budget(bmm_req) == 0) {
+                return;
+            }
+            // same victim rules as models_max eviction: idle, not queued for, not already stopping
+            victim = sched->pick_victim(lk);
+        }
+        if (victim.empty() || victim == name) {
+            return; // nothing idle to give up; the budget check in load() reports it
+        }
+        SRV_INF("memory budget exceeded, removing LRU name=%s\n", victim.c_str());
+        unload(victim);
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this, &victim]() {
+            return mapping[victim].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+        });
+    }
+}
+
+buft_memory_map server_models::estimate_model_memory(const std::string & name) {
+    std::vector<std::string> child_args;
+    std::vector<std::string> child_env;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        server_model_meta meta = mapping[name].meta; // copy: rendering args must not touch the live entry
+        meta.update_args(ctx_preset, bin_path);
+        child_args = meta.args;
+        child_env  = base_env;
+    }
+    child_args.push_back("--measure-only");
+    child_args.push_back("--offline");
+
+    SRV_INF("measuring memory for model name=%s\n", name.c_str());
+
+    common_subproc proc;
+    if (!proc.create(child_args, subprocess_option_no_window | subprocess_option_combined_stdout_stderr, child_env)) {
+        SRV_ERR("failed to spawn measure process for model name=%s\n", name.c_str());
+        return {};
+    }
+
+    buft_memory_map result;
+    if (FILE * out = proc.stdout_file()) {
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), out) != nullptr) {
+            std::string line(buffer);
+            if (!string_starts_with(line, "measure:")) {
+                continue;
+            }
+            std::istringstream iss(line.substr(strlen("measure:")));
+            std::string buft_name;
+            size_t size = 0;
+            if (iss >> buft_name >> size) {
+                auto it = buft_by_name.find(buft_name);
+                if (it != buft_by_name.end()) {
+                    result[it->second] += size;
+                } else {
+                    SRV_WRN("unknown buft '%s' from measure child for model name=%s\n", buft_name.c_str(), name.c_str());
+                }
+            }
+        }
+    }
+
+    const int exit_code = proc.join();
+    if (exit_code != 0) {
+        SRV_ERR("measure process for model name=%s exited with code %d\n", name.c_str(), exit_code);
+        return {};
+    }
+    for (const auto & [buft, size] : result) {
+        SRV_INF("measured model name=%s: %s needs %zu MiB\n", name.c_str(), ggml_backend_buft_name(buft), size / (1024 * 1024));
+    }
+    return result;
+}
+
 void server_models::load(const std::string & name) {
     load(name, load_options{});
 }
@@ -1113,6 +1242,24 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
         unload_lru();
+    }
+
+    buft_memory_map bmm_req;
+    if (!bmm_available.empty() && opts.mode == SERVER_CHILD_MODE_NORMAL && !opts.custom_meta.has_value()) {
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            bmm_req = mapping[name].meta.bmm_req;
+        }
+        if (bmm_req.empty()) {
+            bmm_req = estimate_model_memory(name);
+            if (bmm_req.empty()) {
+                SRV_WRN("could not measure model %s, the memory budget will not apply to it\n", name.c_str());
+            } else {
+                std::lock_guard<std::mutex> lk(mutex);
+                mapping[name].meta.bmm_req = bmm_req;
+            }
+        }
+        unload_for_memory(name, bmm_req);
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -1141,6 +1288,23 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (count_active >= (size_t)base_params.models_max) {
             throw std::runtime_error("model limit reached, try again later");
         }
+    }
+    // The budget decides what to evict; it must never refuse a model that has the machine to
+    // itself. The budget is a startup snapshot of free memory, and a model larger than it (a
+    // cpu-moe model with ~90 GB of experts in RAM) is still loadable - fit places it, or the
+    // child fails with a real reason.
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL && !bmm_req.empty() && count_over_budget(bmm_req) > 0) {
+        bool others_running = false;
+        for (const auto & m : mapping) {
+            if (m.first != name && m.second.meta.is_running()) {
+                others_running = true;
+                break;
+            }
+        }
+        if (others_running) {
+            throw std::runtime_error("model memory budget exceeded, try again later");
+        }
+        SRV_WRN("model %s exceeds the memory budget on its own; loading it anyway\n", name.c_str());
     }
 
     // prepare new instance info

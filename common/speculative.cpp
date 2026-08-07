@@ -1276,6 +1276,8 @@ public:
                     return false;
                 }
                 store_context_features(seq_id, n_chunk);
+                // The server may switch contexts before the next draft decode.
+                llama_synchronize(ctx_dft);
             }
         }
 

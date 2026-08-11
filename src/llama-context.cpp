@@ -2933,6 +2933,126 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+// The range-state envelope is deliberately fixed-width and separate from the
+// legacy whole-sequence state stream.  The checksum is a small host-side
+// integrity check; compatibility and tensor-layout validation remain the
+// responsibility of the component payload readers.
+static constexpr size_t state_seq_range_header_size =
+        sizeof(uint32_t) + // magic
+        sizeof(uint32_t) + // format version
+        sizeof(uint32_t) + // component mask
+        sizeof(uint32_t) + // range flags
+        sizeof(llama_seq_id) +
+        sizeof(llama_pos) + // position start
+        sizeof(llama_pos) + // position end
+        sizeof(uint64_t) + // payload size
+        sizeof(uint64_t);  // payload checksum
+
+static uint64_t state_seq_range_checksum(const uint8_t * data, size_t size) {
+    // FNV-1a is deterministic, cheap, and sufficient to reject accidental
+    // truncation/corruption before passing bytes to a backend tensor reader.
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool state_seq_range_valid(llama_seq_id seq_id, uint32_t components, llama_pos p0, llama_pos p1) {
+    const uint32_t known = LLAMA_STATE_SEQ_COMPONENT_ATTENTION | LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
+    return seq_id >= 0 && components != 0 && (components & ~known) == 0 && p0 >= 0 && p1 > p0;
+}
+
+static uint32_t state_seq_range_save_capabilities(uint32_t components) {
+    uint32_t result = 0;
+    if (components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) {
+        result |= LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE;
+    }
+    if (components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) {
+        result |= LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE;
+    }
+    return result;
+}
+
+static uint32_t state_seq_range_restore_capabilities(uint32_t components) {
+    uint32_t result = 0;
+    if (components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) {
+        result |= LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE;
+    }
+    if (components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) {
+        result |= LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE;
+    }
+    return result;
+}
+
+static bool state_seq_range_flags_valid(uint32_t components, uint32_t capabilities, llama_state_seq_flags flags) {
+    const uint32_t known = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT;
+    if ((flags & ~known) != 0) {
+        return false;
+    }
+
+    // M-RoPE text is an attention-only semantic.  A combined hybrid restore
+    // may pass the bit through to its recurrent child, which ignores it
+    // safely, but a recurrent-only sidecar must use the neutral flag set.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT) != 0) {
+        if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
+                (capabilities & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE) == 0) {
+            return false;
+        }
+    }
+
+    // Device serialization is not composable with the host envelope yet, and
+    // combining it with the M-RoPE semantic would make the stream ambiguous.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT) != 0 ||
+                (capabilities & LLAMA_STATE_SEQ_CAPABILITY_ON_DEVICE) == 0) {
+            return false;
+        }
+    }
+
+    // A context which advertises the specialized 4D layout must not silently
+    // serialize it as a generic range.  The explicit flag is the compatibility
+    // boundary for canonical text-only M-RoPE.
+    if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) != 0 &&
+            (capabilities & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE) != 0 &&
+            (flags & LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT) == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool state_seq_range_can_write(const llama_memory_i * memory, llama_seq_id seq_id, uint32_t components, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    if (!memory || !state_seq_range_valid(seq_id, components, p0, p1)) {
+        return false;
+    }
+
+    const uint32_t present = memory->state_seq_components();
+    const uint32_t caps = memory->state_seq_capabilities();
+    if ((components & ~present) != 0 ||
+            (caps & state_seq_range_save_capabilities(components)) != state_seq_range_save_capabilities(components) ||
+            !state_seq_range_flags_valid(components, caps, flags)) {
+        return false;
+    }
+    return true;
+}
+
+static bool state_seq_range_can_read(const llama_memory_i * memory, llama_seq_id seq_id, uint32_t components, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    if (!memory || !state_seq_range_valid(seq_id, components, p0, p1)) {
+        return false;
+    }
+
+    const uint32_t present = memory->state_seq_components();
+    const uint32_t caps = memory->state_seq_capabilities();
+    if ((components & ~present) != 0 ||
+            (caps & state_seq_range_restore_capabilities(components)) != state_seq_range_restore_capabilities(components) ||
+            !state_seq_range_flags_valid(components, caps, flags)) {
+        return false;
+    }
+    return true;
+}
+
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
@@ -3032,6 +3152,175 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+uint32_t llama_context::state_seq_components() const {
+    return memory ? memory->state_seq_components() : 0;
+}
+
+uint32_t llama_context::state_seq_capabilities() const {
+    return memory ? memory->state_seq_capabilities() : 0;
+}
+
+size_t llama_context::state_seq_get_size_range(
+        llama_seq_id          seq_id,
+        uint32_t              components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!state_seq_range_can_write(memory.get(), seq_id, components, range.p0, range.p1, flags)) {
+        LLAMA_LOG_ERROR("%s: unsupported or invalid range state request\n", __func__);
+        return 0;
+    }
+
+    llama_io_write_dummy io((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0);
+    try {
+        const size_t payload_size = memory->state_write_range(io, seq_id, components, range.p0, range.p1, flags);
+        if (payload_size == 0 || payload_size > SIZE_MAX - state_seq_range_header_size) {
+            return 0;
+        }
+        return state_seq_range_header_size + payload_size;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting range state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_range(
+        llama_seq_id          seq_id,
+        uint8_t *             dst,
+        size_t                size,
+        uint32_t              components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!dst || !state_seq_range_can_write(memory.get(), seq_id, components, range.p0, range.p1, flags)) {
+        LLAMA_LOG_ERROR("%s: unsupported or invalid range state request\n", __func__);
+        return 0;
+    }
+
+    try {
+        llama_io_write_dummy io_dummy((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0);
+        const size_t payload_size = memory->state_write_range(io_dummy, seq_id, components, range.p0, range.p1, flags);
+        if (payload_size == 0 || payload_size > SIZE_MAX - state_seq_range_header_size) {
+            return 0;
+        }
+
+        const size_t total_size = state_seq_range_header_size + payload_size;
+        if (size < total_size) {
+            return 0;
+        }
+
+        std::vector<uint8_t> payload(payload_size);
+        size_t payload_bytes_written = 0;
+        {
+            // llama_io_write_host defers backend tensor_get operations until
+            // destruction.  End this scope before checksumming or publishing
+            // the payload so device-resident recurrent/KV bytes are present.
+            llama_io_write_host io_payload(payload.data(), payload.size());
+            memory->state_write_range(io_payload, seq_id, components, range.p0, range.p1, flags);
+            payload_bytes_written = io_payload.n_bytes();
+        }
+        if (payload_bytes_written != payload_size) {
+            LLAMA_LOG_ERROR("%s: range state payload size changed during serialization\n", __func__);
+            return 0;
+        }
+
+        llama_io_write_host io(dst, size);
+        const uint32_t magic = LLAMA_STATE_SEQ_RANGE_MAGIC;
+        const uint32_t version = LLAMA_STATE_SEQ_RANGE_VERSION;
+        const uint64_t payload_size_u64 = payload_size;
+        const uint64_t checksum = state_seq_range_checksum(payload.data(), payload.size());
+        io.write(&magic, sizeof(magic));
+        io.write(&version, sizeof(version));
+        io.write(&components, sizeof(components));
+        io.write(&flags, sizeof(flags));
+        io.write(&seq_id, sizeof(seq_id));
+        io.write(&range.p0, sizeof(range.p0));
+        io.write(&range.p1, sizeof(range.p1));
+        io.write(&payload_size_u64, sizeof(payload_size_u64));
+        io.write(&checksum, sizeof(checksum));
+        io.write(payload.data(), payload.size());
+        return io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving range state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_data_range(
+        llama_seq_id          dest_seq_id,
+        const uint8_t *       src,
+        size_t                size,
+        uint32_t              components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!src || !state_seq_range_can_read(memory.get(), dest_seq_id, components, range.p0, range.p1, flags) || size < state_seq_range_header_size) {
+        LLAMA_LOG_ERROR("%s: unsupported or invalid range state request\n", __func__);
+        return 0;
+    }
+
+    bool restore_started = false;
+    try {
+        llama_io_read_host io(src, size);
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        uint32_t stream_components = 0;
+        llama_state_seq_flags stream_flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+        llama_seq_id source_seq_id = -1;
+        llama_pos stream_p0 = -1;
+        llama_pos stream_p1 = -1;
+        uint64_t payload_size_u64 = 0;
+        uint64_t checksum = 0;
+
+        io.read(&magic, sizeof(magic));
+        io.read(&version, sizeof(version));
+        io.read(&stream_components, sizeof(stream_components));
+        io.read(&stream_flags, sizeof(stream_flags));
+        io.read(&source_seq_id, sizeof(source_seq_id));
+        io.read(&stream_p0, sizeof(stream_p0));
+        io.read(&stream_p1, sizeof(stream_p1));
+        io.read(&payload_size_u64, sizeof(payload_size_u64));
+        io.read(&checksum, sizeof(checksum));
+
+        if (magic != LLAMA_STATE_SEQ_RANGE_MAGIC || version != LLAMA_STATE_SEQ_RANGE_VERSION ||
+                source_seq_id < 0 || stream_components != components || stream_flags != flags ||
+                stream_p0 != range.p0 || stream_p1 != range.p1 ||
+                payload_size_u64 > SIZE_MAX || payload_size_u64 > size - state_seq_range_header_size) {
+            LLAMA_LOG_ERROR("%s: invalid range state envelope\n", __func__);
+            return 0;
+        }
+
+        const size_t payload_size = (size_t) payload_size_u64;
+        if (payload_size == 0) {
+            return 0;
+        }
+
+        std::vector<uint8_t> payload(payload_size);
+        io.read(payload.data(), payload.size());
+        if (state_seq_range_checksum(payload.data(), payload.size()) != checksum) {
+            LLAMA_LOG_ERROR("%s: range state payload checksum mismatch\n", __func__);
+            return 0;
+        }
+
+        llama_io_read_host io_payload(payload.data(), payload.size());
+        restore_started = true;
+        const size_t nread = memory->state_read_range(io_payload, dest_seq_id, components, range.p0, range.p1, flags);
+        if (nread != payload_size || io_payload.n_bytes() != payload_size) {
+            LLAMA_LOG_ERROR("%s: range state payload was not fully consumed\n", __func__);
+            // A component reader should be transactional, but keep the
+            // public boundary fail-closed if a reader reports an inconsistent
+            // byte count after mutating the destination.  This only removes
+            // the concrete destination sequence; other sequences are intact.
+            memory->seq_rm(dest_seq_id, -1, -1);
+            return 0;
+        }
+        return state_seq_range_header_size + payload_size;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading range state: %s\n", __func__, err.what());
+        if (restore_started && memory) {
+            memory->seq_rm(dest_seq_id, -1, -1);
+        }
         return 0;
     }
 }
@@ -4092,6 +4381,57 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+uint32_t llama_state_seq_components(llama_context * ctx) {
+    return ctx ? ctx->state_seq_components() : 0;
+}
+
+uint32_t llama_state_seq_capabilities(llama_context * ctx) {
+    return ctx ? ctx->state_seq_capabilities() : 0;
+}
+
+size_t llama_state_seq_get_size_range(
+        llama_context * ctx,
+        llama_seq_id   seq_id,
+        uint32_t       components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!ctx) {
+        return 0;
+    }
+    ctx->synchronize();
+    return ctx->state_seq_get_size_range(seq_id, components, range, flags);
+}
+
+size_t llama_state_seq_get_data_range(
+        llama_context * ctx,
+        uint8_t *      dst,
+        size_t         size,
+        llama_seq_id   seq_id,
+        uint32_t       components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!ctx) {
+        return 0;
+    }
+    ctx->synchronize();
+    return ctx->state_seq_get_data_range(seq_id, dst, size, components, range, flags);
+}
+
+size_t llama_state_seq_set_data_range(
+        llama_context * ctx,
+        const uint8_t * src,
+        size_t         size,
+        llama_seq_id   dest_seq_id,
+        uint32_t       components,
+        llama_state_seq_range range,
+        llama_state_seq_flags flags) {
+    if (!ctx) {
+        return 0;
+    }
+    ctx->synchronize();
+    return ctx->state_seq_set_data_range(dest_seq_id, src, size, components, range, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

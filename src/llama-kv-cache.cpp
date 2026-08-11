@@ -2082,6 +2082,287 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     }
 }
 
+uint32_t llama_kv_cache::state_seq_components() const {
+    // A cache which aliases another cache's storage cannot provide an
+    // independent range artifact.  The owning cache advertises the contract.
+    if (other || layers.empty()) {
+        return 0;
+    }
+
+    return LLAMA_STATE_SEQ_COMPONENT_ATTENTION;
+}
+
+uint32_t llama_kv_cache::state_seq_capabilities() const {
+    if (state_seq_components() == 0) {
+        return 0;
+    }
+
+    uint32_t caps = LLAMA_STATE_SEQ_CAPABILITY_ATTENTION;
+
+    // SWA (unless represented by a full-size cache) does not satisfy the
+    // exact range contract.
+    if (n_swa != 0) {
+        LLAMA_LOG_DEBUG("%s: attention range unavailable: sliding-window cache does not retain full coverage\n",
+                __func__);
+        return caps;
+    }
+
+    if (hparams.n_pos_per_embd() == 1) {
+        caps |=
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE |
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE;
+    } else if (hparams.n_pos_per_embd() == 4) {
+        // This is deliberately narrower than generic multidimensional range
+        // support.  The flag contract proves a pure-text M-RoPE sequence:
+        // [primary, primary, primary, 0].  The cache retains the primary/x/y
+        // metadata needed by its causal mask; the fourth coordinate is
+        // reconstructed as the contractually fixed zero.
+        caps |=
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE |
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE |
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE;
+        LLAMA_LOG_DEBUG("%s: attention range requires explicit canonical M-RoPE text provenance\n", __func__);
+    } else {
+        LLAMA_LOG_DEBUG("%s: attention range unavailable: unsupported position dimensions = %u\n",
+                __func__, hparams.n_pos_per_embd());
+    }
+
+    // Additive restore into a unified cache is safe because this
+    // implementation only claims empty cells, never reuses an occupied cell
+    // merely because its position happens to match, and removes every newly
+    // published destination tag if the tensor write fails.
+    if (n_stream == 1) {
+        caps |= LLAMA_STATE_SEQ_CAPABILITY_UNIFIED_KV_RESTORE;
+    }
+
+    return caps;
+}
+
+size_t llama_kv_cache::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        uint32_t components,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) const {
+    const size_t n_bytes_start = io.n_bytes();
+
+    const bool flags_valid =
+        (hparams.n_pos_per_embd() == 1 && flags == LLAMA_STATE_SEQ_FLAGS_NONE) ||
+        (hparams.n_pos_per_embd() == 4 && flags == LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT);
+
+    if (components != LLAMA_STATE_SEQ_COMPONENT_ATTENTION ||
+        (state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE) == 0 ||
+        !flags_valid ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+        p0 < 0 || p1 <= p0) {
+        LLAMA_LOG_ERROR("%s: unsupported or invalid attention range request (seq=%d, range=[%d,%d))\n",
+                __func__, seq_id, p0, p1);
+        return 0;
+    }
+
+    const uint64_t range_len = (uint64_t) (p1 - p0);
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    if (range_len > std::numeric_limits<uint32_t>::max() || range_len > cells.size()) {
+        LLAMA_LOG_ERROR("%s: attention range is too large\n", __func__);
+        return 0;
+    }
+
+    cell_ranges_t cr { seq_to_stream[seq_id], {} };
+
+    uint32_t cell_count = 0;
+    uint32_t range_begin = cells.size();
+    std::vector<uint32_t> position_counts((size_t) range_len, 0);
+    bool canonical_mrope_text = true;
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        const bool selected = !cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1);
+
+        if (selected) {
+            const llama_pos pos = cells.pos_get(i);
+            ++position_counts[(size_t) (pos - p0)];
+            ++cell_count;
+
+            if (hparams.n_pos_per_embd() == 4) {
+                const auto & ext = cells.ext_get(i);
+                canonical_mrope_text = canonical_mrope_text && ext.x == pos && ext.y == pos;
+            }
+
+            if (range_begin == cells.size()) {
+                range_begin = i;
+            }
+        } else if (range_begin != cells.size()) {
+            cr.data.emplace_back(range_begin, i);
+            range_begin = cells.size();
+        }
+    }
+
+    if (range_begin != cells.size()) {
+        cr.data.emplace_back(range_begin, cells.size());
+    }
+
+    // The range contract is exact: one and only one cell for every logical
+    // one-dimensional position.  This catches gaps, duplicate positions,
+    // SWA eviction, and position remapping before any bytes are written.
+    if (!canonical_mrope_text ||
+        cell_count != range_len ||
+        std::any_of(position_counts.begin(), position_counts.end(), [](uint32_t n) { return n != 1; })) {
+        LLAMA_LOG_ERROR("%s: attention range is not canonical text or does not cover every position exactly once (seq=%d, range=[%d,%d))\n",
+                __func__, seq_id, p0, p1);
+        return 0;
+    }
+
+    io.write(&cell_count, sizeof(cell_count));
+    state_write_meta(io, cr, seq_id);
+    state_write_data(io, cr);
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+size_t llama_kv_cache::state_read_range(
+        llama_io_read_i & io,
+        llama_seq_id dest_seq_id,
+        uint32_t components,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) {
+    const size_t n_bytes_start = io.n_bytes();
+
+    const bool flags_valid =
+        (hparams.n_pos_per_embd() == 1 && flags == LLAMA_STATE_SEQ_FLAGS_NONE) ||
+        (hparams.n_pos_per_embd() == 4 && flags == LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT);
+
+    if (components != LLAMA_STATE_SEQ_COMPONENT_ATTENTION ||
+        (state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE) == 0 ||
+        !flags_valid ||
+        dest_seq_id < 0 || (size_t) dest_seq_id >= seq_to_stream.size() ||
+        p0 < 0 || p1 <= p0) {
+        LLAMA_LOG_ERROR("%s: unsupported or invalid attention range request (dest=%d, range=[%d,%d))\n",
+                __func__, dest_seq_id, p0, p1);
+        return 0;
+    }
+
+    const uint64_t range_len = (uint64_t) (p1 - p0);
+    const uint32_t strm = seq_to_stream[dest_seq_id];
+    auto & cells = v_cells[strm];
+    if (range_len > std::numeric_limits<uint32_t>::max() || range_len > cells.size()) {
+        LLAMA_LOG_ERROR("%s: attention range is too large\n", __func__);
+        return 0;
+    }
+
+    // Parse the metadata before touching the destination.  The source id is
+    // deliberately discarded: the range envelope owns source identity and
+    // the cell is always retagged to the concrete destination sequence.
+    uint32_t cell_count = 0;
+    std::vector<llama_pos> positions;
+    std::vector<llama_kv_cell_ext> position_ext;
+
+    try {
+        io.read(&cell_count, sizeof(cell_count));
+        if (cell_count != range_len) {
+            LLAMA_LOG_ERROR("%s: range cell count mismatch (%u != %u)\n",
+                    __func__, cell_count, (uint32_t) range_len);
+            return 0;
+        }
+
+        positions.resize(cell_count);
+        if (hparams.n_pos_per_embd() == 4) {
+            position_ext.resize(cell_count);
+        }
+        std::vector<uint32_t> position_counts((size_t) range_len, 0);
+
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            uint32_t n_seq_id = 0;
+            io.read(&positions[i], sizeof(positions[i]));
+            io.read(&n_seq_id, sizeof(n_seq_id));
+
+            if (positions[i] < p0 || positions[i] >= p1 || n_seq_id != 1) {
+                LLAMA_LOG_ERROR("%s: invalid attention range metadata at cell %u\n", __func__, i);
+                return 0;
+            }
+
+            ++position_counts[(size_t) (positions[i] - p0)];
+
+            if (hparams.n_pos_per_embd() == 4) {
+                io.read(&position_ext[i], sizeof(position_ext[i]));
+                if (position_ext[i].x != positions[i] || position_ext[i].y != positions[i]) {
+                    LLAMA_LOG_ERROR("%s: non-canonical M-RoPE text metadata at cell %u\n", __func__, i);
+                    return 0;
+                }
+            }
+
+            llama_seq_id source_seq_id = -1;
+            io.read(&source_seq_id, sizeof(source_seq_id));
+            if (source_seq_id < 0 || (uint32_t) source_seq_id >= n_seq_max) {
+                LLAMA_LOG_ERROR("%s: invalid serialized source sequence id\n", __func__);
+                return 0;
+            }
+        }
+
+        if (std::any_of(position_counts.begin(), position_counts.end(), [](uint32_t n) { return n != 1; })) {
+            LLAMA_LOG_ERROR("%s: attention range has missing or duplicate positions\n", __func__);
+            return 0;
+        }
+    } catch (...) {
+        return 0;
+    }
+
+    // Additive restore rejects overlap with the destination but leaves every
+    // other sequence untouched.  In particular, an occupied cell belonging to
+    // another sequence is never overwritten or silently retagged.
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, dest_seq_id) && cells.pos_in(i, p0, p1)) {
+            LLAMA_LOG_ERROR("%s: destination sequence already overlaps range at position %d\n",
+                    __func__, cells.pos_get(i));
+            return 0;
+        }
+    }
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+    ubatch.seq_id_unq[0] = dest_seq_id;
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        ubatch.pos[i]      = positions[i];
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &dest_seq_id;
+
+        if (hparams.n_pos_per_embd() == 4) {
+            ubatch.pos[i + ubatch.n_tokens]     = position_ext[i].y;
+            ubatch.pos[i + ubatch.n_tokens * 2] = position_ext[i].x;
+            ubatch.pos[i + ubatch.n_tokens * 3] = 0;
+        }
+    }
+
+    const uint32_t head_old = v_heads[strm];
+    const slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: failed to find %u available cells in kv cache\n", __func__, cell_count);
+        return 0;
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    bool ok = false;
+    try {
+        ok = state_read_data(io, strm, cell_count, sinfo);
+    } catch (...) {
+        ok = false;
+    }
+
+    if (!ok) {
+        // Only freshly allocated cells can carry dest_seq_id in this range,
+        // so removing the destination range is an exact rollback and cannot
+        // disturb unrelated tags or bytes.  Restore the allocator head as
+        // well, keeping the operation transactional for subsequent callers.
+        seq_rm(dest_seq_id, p0, p1);
+        v_heads[strm] = head_old;
+        return 0;
+    }
+
+    return io.n_bytes() - n_bytes_start;
+}
+
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 

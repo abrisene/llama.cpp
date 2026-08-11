@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-decode-arbiter.h"
 #include "server-prefix-admission.h"
 #include "server-prefix-cache.h"
 
@@ -1603,6 +1604,8 @@ private:
 
     std::unique_ptr<server_prefix_cache::PrefixAdmission> prefix_cache_admission;
 
+    server_decode_arbiter decode_arbiter;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -2827,6 +2830,18 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * path = getenv("LLAMA_SERVER_DECODE_ARBITER");
+            if (path != nullptr && path[0] != '\0') {
+                std::string error;
+                if (!decode_arbiter.open(path, error)) {
+                    SRV_ERR("%s\n", error.c_str());
+                    return false;
+                }
+                SRV_INF("cross-model decode arbiter enabled: %s\n", path);
             }
         }
 
@@ -5153,6 +5168,15 @@ private:
             }
         }
 
+        bool has_generation = false;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.is_processing()) {
+                has_generation = true;
+                break;
+            }
+        }
+        auto decode_lease = has_generation ? decode_arbiter.acquire() : server_decode_arbiter::lease{};
+
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
@@ -5225,6 +5249,12 @@ private:
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
+        }
+        if (decode_lease) {
+            // llama_decode() submits backend work asynchronously. Keep the
+            // cross-process lease until the Metal work is actually complete;
+            // otherwise the arbiter would only serialize command submission.
+            llama_synchronize(ctx_tgt);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -5620,6 +5650,19 @@ void server_context::prefix_cache_mark_explicit_precache_success() {
 
 void server_context::prefix_cache_mark_explicit_precache_failure() {
     impl->prefix_cache_metrics.explicit_precache_failures++;
+}
+
+json server_context::decode_arbiter_json() const {
+    const auto stats = impl->decode_arbiter.stats();
+    return {
+        {"enabled",      stats.enabled},
+        {"acquisitions", stats.acquisitions},
+        {"contentions",  stats.contentions},
+        {"handoffs",     stats.contentions},
+        {"concurrent_demand", stats.contentions},
+        {"wait_us",      stats.wait_us},
+        {"hold_us",      stats.hold_us},
+    };
 }
 
 //
@@ -6164,6 +6207,7 @@ void server_routes::init_routes() {
             { "endpoint_metrics",            params.endpoint_metrics },
             { "ui",                          params.ui },
             { "prefix_cache",                this->ctx_server.prefix_cache_json() },
+            { "decode_arbiter",              this->ctx_server_mut.decode_arbiter_json() },
             { "ui_settings",                 meta->json_ui_settings },
             { "chat_template",               tmpl_default },
             { "chat_template_caps",          meta->chat_template_caps },

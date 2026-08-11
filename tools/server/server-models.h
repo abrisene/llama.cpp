@@ -207,6 +207,7 @@ private:
     std::string bin_path;
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
+    std::string decode_arbiter_path;
 
     // queue of requests waiting for a models_max slot
     std::unique_ptr<server_lru_sched> sched;

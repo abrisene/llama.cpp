@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-decode-arbiter.cpp
+    server-decode-arbiter.h
     server-prefix-admission.cpp
     server-prefix-admission.h
     server-prefix-cache.cpp

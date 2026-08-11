@@ -1653,6 +1653,81 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "enable the persistent prefix cache at PATH (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("cache-disk path must not be empty");
+            }
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "N",
+        string_format("maximum persistent prefix-cache disk use in MiB (default: %d; required with --cache-disk)", params.cache_disk_size_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("cache-disk-size must be greater than zero");
+            }
+            params.cache_disk_size_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-block-size"}, "N",
+        string_format("positions per persistent prefix-cache block (default: %d; minimum 256, power of two)", params.cache_block_size),
+        [](common_params & params, int value) {
+            if (value < 256 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("cache-block-size must be a power of two >= 256");
+            }
+            params.cache_block_size = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-write-buffer"}, "N",
+        "maximum pending persistent prefix-cache writes in MiB (default: derived from one block and one recurrent snapshot, 0 = derive)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-write-buffer must be non-negative");
+            }
+            params.cache_write_buffer_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_WRITE_BUFFER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-capture-mode"}, "MODE",
+        "persistent prefix-cache capture mode: always, repeat, or explicit (default: repeat)",
+        [](common_params & params, const std::string & value) {
+            if (value == "always") {
+                params.cache_capture_mode = common_params::CACHE_CAPTURE_MODE_ALWAYS;
+            } else if (value == "repeat") {
+                params.cache_capture_mode = common_params::CACHE_CAPTURE_MODE_REPEAT;
+            } else if (value == "explicit") {
+                params.cache_capture_mode = common_params::CACHE_CAPTURE_MODE_EXPLICIT;
+            } else {
+                throw std::invalid_argument("cache-capture-mode must be one of: always, repeat, explicit");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_CAPTURE_MODE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-admission-items"}, "N",
+        string_format("maximum repeat-admission entries for the persistent prefix cache (default: %d)", params.cache_admission_items),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-admission-items must be non-negative");
+            }
+            params.cache_admission_items = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_ADMISSION_ITEMS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-recurrent-stride"}, "N",
+        string_format("persistent prefix-cache recurrent sidecar stride in attention blocks (default: %d)", params.cache_recurrent_stride),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-recurrent-stride must be at least one");
+            }
+            params.cache_recurrent_stride = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RECURRENT_STRIDE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

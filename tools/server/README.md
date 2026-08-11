@@ -163,7 +163,14 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
-| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable; persistent `--cache-disk` mode requires a finite value)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-disk PATH` | enable the persistent token-aligned prefix cache at `PATH` (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DISK) |
+| `--cache-disk-size N` | maximum persistent prefix-cache disk use in MiB; required with `--cache-disk` (env: LLAMA_ARG_CACHE_DISK_SIZE) |
+| `--cache-block-size N` | positions per persistent prefix-cache block (default: 2048; minimum 256; power of two)<br/>(env: LLAMA_ARG_CACHE_BLOCK_SIZE) |
+| `--cache-write-buffer N` | maximum pending persistent prefix-cache writes in MiB (default: derived; 0 = derive)<br/>(env: LLAMA_ARG_CACHE_WRITE_BUFFER) |
+| `--cache-capture-mode MODE` | persistent prefix-cache capture mode: `always`, `repeat`, or `explicit` (default: `repeat`)<br/>(env: LLAMA_ARG_CACHE_CAPTURE_MODE) |
+| `--cache-admission-items N` | maximum repeat-admission entries for the persistent prefix cache (default: 8192; must be greater than zero in `repeat` mode)<br/>(env: LLAMA_ARG_CACHE_ADMISSION_ITEMS) |
+| `--cache-recurrent-stride N` | recurrent sidecar stride in attention blocks (default: 4; minimum 1)<br/>(env: LLAMA_ARG_CACHE_RECURRENT_STRIDE) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -855,6 +862,9 @@ By default, it is read-only. To make POST request to change global properties, y
 - `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info)
 - `modalities` - the list of supported modalities
 - `is_sleeping` - sleeping status, see [Sleeping on idle](#sleeping-on-idle)
+- `prefix_cache` - persistent prefix-cache configuration and live counters. It is disabled unless `--cache-disk` is set.
+
+Completion requests may include `"cache_persist": true` to request persistent prefix-cache capture for that request. This affects capture admission only; lookup and all eligibility checks are unchanged. Ordinary completion responses include `persistent_cache` metadata for request, eligibility, staged blocks, and reason. Deferred attention materialization runs after the final response is queued, so ordinary completion responses report `published_blocks: 0` and `durable: false` for newly staged captures.
 
 ### POST `/props`: Change server global properties.
 
@@ -862,7 +872,14 @@ To use this endpoint with POST method, you need to start server with `--props`
 
 *Options:*
 
-- None yet
+- `{"action":"prefix_cache.clear_hot"}` clears this model's bounded hot tier.
+- `{"action":"prefix_cache.clear_disk"}` clears this model signature's persistent artifacts.
+
+Both actions require `--props` and are serialized with cache readers and writers.
+
+### POST `/cache/prefix`: Precache a prompt prefix.
+
+Evaluates a native `prompt` request or an OpenAI-style `messages` request with persistent capture forced and no generated output. This endpoint waits for materialization and writer flush, then reports the evaluated token count, deepest published boundary, attention block count, recurrent sidecar count, published bytes, durability, and reason.
 
 ### POST `/embeddings`: non-OpenAI-compatible embeddings API
 

@@ -396,6 +396,153 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+uint32_t llama_memory_recurrent::state_seq_components() const {
+    return LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
+}
+
+uint32_t llama_memory_recurrent::state_seq_capabilities() const {
+    return LLAMA_STATE_SEQ_CAPABILITY_RECURRENT |
+           LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE |
+           LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE;
+}
+
+size_t llama_memory_recurrent::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        uint32_t components,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) const {
+    const size_t n_bytes_start = io.n_bytes();
+
+    if (components != LLAMA_STATE_SEQ_COMPONENT_RECURRENT) {
+        throw std::runtime_error("recurrent range state requires the recurrent component");
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        throw std::runtime_error("recurrent range state does not support on-device serialization");
+    }
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size() || (uint32_t) seq_id >= size) {
+        throw std::runtime_error("recurrent range state requires a concrete sequence id");
+    }
+    if (p0 != 0 || p1 <= 0) {
+        throw std::runtime_error("recurrent range state requires a [0, boundary) range");
+    }
+    if (rs_idx[seq_id] != 0) {
+        throw std::runtime_error("cannot save recurrent state with a pending rollback plane");
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0 || (uint32_t) tail_id >= size) {
+        throw std::runtime_error("recurrent sequence has no live state");
+    }
+
+    const auto & tail = cells[tail_id];
+    if (!tail.has_seq_id(seq_id) || tail.pos != p1 - 1) {
+        throw std::runtime_error("recurrent state boundary does not match the live sequence");
+    }
+
+    // Recurrent memory has one live cell per sequence.  Refuse malformed or
+    // partially reconstructed metadata instead of serializing an ambiguous
+    // state that could not be replaced safely.
+    uint32_t cell_count = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].has_seq_id(seq_id)) {
+            ++cell_count;
+        }
+    }
+    if (cell_count != 1) {
+        throw std::runtime_error("recurrent sequence does not have exactly one live state cell");
+    }
+
+    const int32_t src_id = tail.src >= 0 ? tail.src : tail_id;
+    if (src_id < 0 || (uint32_t) src_id >= size) {
+        throw std::runtime_error("recurrent sequence has an invalid live state source");
+    }
+
+    // Keep the legacy recurrent payload format inside the range envelope: one
+    // metadata row followed by one logical R/S row per non-null layer.
+    io.write(&cell_count, sizeof(cell_count));
+    state_write_meta(io, {{ (uint32_t) tail_id, (uint32_t) tail_id + 1 }}, seq_id);
+    state_write_data(io, {{ (uint32_t) src_id, (uint32_t) src_id + 1 }});
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+size_t llama_memory_recurrent::state_read_range(
+        llama_io_read_i & io,
+        llama_seq_id dest_seq_id,
+        uint32_t components,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) {
+    const size_t n_bytes_start = io.n_bytes();
+
+    if (components != LLAMA_STATE_SEQ_COMPONENT_RECURRENT) {
+        throw std::runtime_error("recurrent range state requires the recurrent component");
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        throw std::runtime_error("recurrent range state does not support on-device serialization");
+    }
+    if (dest_seq_id < 0 || (size_t) dest_seq_id >= rs_idx.size() || (uint32_t) dest_seq_id >= size) {
+        throw std::runtime_error("recurrent range restore requires a concrete destination sequence id");
+    }
+    if (p0 != 0 || p1 <= 0) {
+        throw std::runtime_error("recurrent range state requires a [0, boundary) range");
+    }
+
+    try {
+        // Persistent restore starts from an empty destination.  This also
+        // releases a unique old cell before the capacity check; a shared old
+        // cell remains occupied and therefore correctly requires another free
+        // cell for the replacement.
+        seq_rm(dest_seq_id, -1, -1);
+
+        // Avoid find_slot()'s optimistic empty-cell assertion when a restore
+        // needs a new cell (the destination was absent or shared).  At this
+        // point a unique old destination has already made its cell available.
+        const bool has_empty_cell = std::any_of(cells.begin(), cells.end(),
+                [](const mem_cell & cell) { return cell.is_empty(); });
+        if (!has_empty_cell) {
+            throw std::runtime_error("no free recurrent cell for range restore");
+        }
+
+        uint32_t cell_count = 0;
+        io.read(&cell_count, sizeof(cell_count));
+        if (cell_count != 1) {
+            throw std::runtime_error("recurrent range state must contain exactly one cell");
+        }
+
+        if (!state_read_meta(io, cell_count, dest_seq_id)) {
+            throw std::runtime_error("failed to reconstruct recurrent state metadata");
+        }
+
+        const int32_t tail_id = cells[dest_seq_id].tail;
+        if (tail_id < 0 || (uint32_t) tail_id >= size ||
+                !cells[tail_id].has_seq_id(dest_seq_id) ||
+                cells[tail_id].pos != p1 - 1) {
+            throw std::runtime_error("restored recurrent state boundary does not match the requested range");
+        }
+
+        // state_read_meta() rebuilds the tail and marks the row as its own
+        // source.  Keep that invariant explicit here: replacing tensor rows
+        // without these metadata links would silently read stale state later.
+        cells[tail_id].src = tail_id;
+
+        if (!state_read_data(io, cell_count)) {
+            throw std::runtime_error("failed to restore recurrent state data");
+        }
+
+        set_rs_idx(dest_seq_id, 0);
+        return io.n_bytes() - n_bytes_start;
+    } catch (...) {
+        // Only the destination sequence is touched by state_read_meta() and
+        // find_slot().  Remove it again on every failure, preserving all other
+        // sequence tags and cells.
+        seq_rm(dest_seq_id, -1, -1);
+        throw;
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

@@ -109,6 +109,14 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    cache_disk_path: str | None = None
+    cache_disk_size_mib: int | None = None
+    cache_block_size: int | None = None
+    cache_write_buffer_mib: int | None = None
+    cache_capture_mode: str | None = None
+    cache_admission_items: int | None = None
+    cache_recurrent_stride: int | None = None
+    endpoint_props: bool | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -265,6 +273,22 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.cache_disk_path:
+            server_args.extend(["--cache-disk", self.cache_disk_path])
+        if self.cache_disk_size_mib is not None:
+            server_args.extend(["--cache-disk-size", self.cache_disk_size_mib])
+        if self.cache_block_size is not None:
+            server_args.extend(["--cache-block-size", self.cache_block_size])
+        if self.cache_write_buffer_mib is not None:
+            server_args.extend(["--cache-write-buffer", self.cache_write_buffer_mib])
+        if self.cache_capture_mode is not None:
+            server_args.extend(["--cache-capture-mode", self.cache_capture_mode])
+        if self.cache_admission_items is not None:
+            server_args.extend(["--cache-admission-items", self.cache_admission_items])
+        if self.cache_recurrent_stride is not None:
+            server_args.extend(["--cache-recurrent-stride", self.cache_recurrent_stride])
+        if self.endpoint_props:
+            server_args.append("--props")
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

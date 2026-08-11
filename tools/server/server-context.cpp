@@ -6,6 +6,8 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prefix-admission.h"
+#include "server-prefix-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -25,6 +27,14 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <limits>
+#include <cstring>
+#include <iomanip>
+#include <regex>
+#include <sstream>
+#include <iterator>
+#include <atomic>
+#include <unordered_set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -33,9 +43,549 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 using json = nlohmann::ordered_json;
+
+namespace {
+
+static void prefix_cache_append_u32(std::vector<uint8_t> & out, uint32_t value) {
+    out.push_back((uint8_t) (value >>  0));
+    out.push_back((uint8_t) (value >>  8));
+    out.push_back((uint8_t) (value >> 16));
+    out.push_back((uint8_t) (value >> 24));
+}
+
+static void prefix_cache_append_u64(std::vector<uint8_t> & out, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back((uint8_t) (value >> (i * 8)));
+    }
+}
+
+static void prefix_cache_append_string(std::vector<uint8_t> & out, const std::string & value) {
+    prefix_cache_append_u64(out, value.size());
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+static uint32_t prefix_cache_float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// Small self-contained SHA-256 implementation used only while constructing a
+// persistent-cache namespace.  Keeping the digest in the signature prevents
+// a same-size/same-mtime model replacement from reusing serialized state.
+struct prefix_cache_sha256 {
+    uint32_t h[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+    uint8_t block[64] = {};
+    size_t n = 0;
+    uint64_t bits = 0;
+
+    static uint32_t rotr(uint32_t x, uint32_t r) {
+        return (x >> r) | (x << (32 - r));
+    }
+
+    void transform(const uint8_t * data) {
+        static constexpr uint32_t k[] = {
+            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u,
+        };
+        uint32_t w[64] = {};
+        for (int i = 0; i < 16; ++i) {
+            w[i] = ((uint32_t) data[i*4] << 24) | ((uint32_t) data[i*4+1] << 16) |
+                   ((uint32_t) data[i*4+2] << 8) | (uint32_t) data[i*4+3];
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+            const uint32_t s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0], b=h[1], c=h[2], d=h[3], e=h[4], f=h[5], g=h[6], hh=h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t t1 = hh + s1 + ch + k[i] + w[i];
+            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = s0 + maj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+
+    void update(const uint8_t * data, size_t size) {
+        bits += (uint64_t) size * 8;
+        while (size > 0) {
+            const size_t take = std::min(size, sizeof(block) - n);
+            std::memcpy(block + n, data, take);
+            n += take;
+            data += take;
+            size -= take;
+            if (n == sizeof(block)) {
+                transform(block);
+                n = 0;
+            }
+        }
+    }
+
+    std::array<uint8_t, 32> finish() {
+        block[n++] = 0x80;
+        if (n > 56) {
+            while (n < 64) block[n++] = 0;
+            transform(block);
+            n = 0;
+        }
+        while (n < 56) block[n++] = 0;
+        for (int i = 0; i < 8; ++i) block[56 + i] = (uint8_t) (bits >> (56 - i * 8));
+        transform(block);
+        std::array<uint8_t, 32> out{};
+        for (int i = 0; i < 8; ++i) {
+            out[i*4+0] = (uint8_t) (h[i] >> 24);
+            out[i*4+1] = (uint8_t) (h[i] >> 16);
+            out[i*4+2] = (uint8_t) (h[i] >> 8);
+            out[i*4+3] = (uint8_t) h[i];
+        }
+        return out;
+    }
+};
+
+struct prefix_cache_file_identity {
+    std::string path;
+    uint64_t size = 0;
+    uint64_t mtime_ns = 0;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+
+    bool operator==(const prefix_cache_file_identity & other) const {
+        return path == other.path && size == other.size && mtime_ns == other.mtime_ns &&
+               device == other.device && inode == other.inode;
+    }
+};
+
+static bool prefix_cache_file_identity_for(const std::string & raw_path, prefix_cache_file_identity & result) {
+    try {
+        result.path = std::filesystem::weakly_canonical(std::filesystem::path(raw_path)).string();
+        const auto st = std::filesystem::symlink_status(result.path);
+        if (!std::filesystem::is_regular_file(st)) {
+            return false;
+        }
+        result.size = std::filesystem::file_size(result.path);
+        result.mtime_ns = (uint64_t) std::filesystem::last_write_time(result.path).time_since_epoch().count();
+#if defined(_WIN32)
+        result.device = 0;
+        result.inode = 0;
+#else
+        struct stat native_st {};
+        if (::stat(result.path.c_str(), &native_st) != 0 || !S_ISREG(native_st.st_mode)) {
+            return false;
+        }
+        result.device = (uint64_t) native_st.st_dev;
+        result.inode = (uint64_t) native_st.st_ino;
+        // filesystem::file_time_type is implementation-defined.  The native
+        // timestamp is the identity used for POSIX memo records.
+#if defined(__APPLE__)
+        result.mtime_ns = (uint64_t) native_st.st_mtimespec.tv_sec * 1000000000ull +
+                          (uint64_t) native_st.st_mtimespec.tv_nsec;
+#else
+        result.mtime_ns = (uint64_t) native_st.st_mtim.tv_sec * 1000000000ull +
+                          (uint64_t) native_st.st_mtim.tv_nsec;
+#endif
+#endif
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void prefix_cache_append_identity(std::vector<uint8_t> & out, const prefix_cache_file_identity & identity) {
+    prefix_cache_append_string(out, identity.path);
+    prefix_cache_append_u64(out, identity.size);
+    prefix_cache_append_u64(out, identity.mtime_ns);
+    prefix_cache_append_u64(out, identity.device);
+    prefix_cache_append_u64(out, identity.inode);
+}
+
+static bool prefix_cache_read_u32(const std::vector<uint8_t> & data, size_t & offset, uint32_t & result) {
+    if (offset > data.size() || data.size() - offset < sizeof(uint32_t)) return false;
+    result = (uint32_t) data[offset] | ((uint32_t) data[offset + 1] << 8) |
+             ((uint32_t) data[offset + 2] << 16) | ((uint32_t) data[offset + 3] << 24);
+    offset += sizeof(uint32_t);
+    return true;
+}
+
+static bool prefix_cache_read_u64(const std::vector<uint8_t> & data, size_t & offset, uint64_t & result) {
+    if (offset > data.size() || data.size() - offset < sizeof(uint64_t)) return false;
+    result = 0;
+    for (int i = 0; i < 8; ++i) result |= (uint64_t) data[offset + i] << (i * 8);
+    offset += sizeof(uint64_t);
+    return true;
+}
+
+static bool prefix_cache_read_string(const std::vector<uint8_t> & data, size_t & offset, std::string & result) {
+    uint64_t size = 0;
+    if (!prefix_cache_read_u64(data, offset, size) || size > data.size() - offset) return false;
+    result.assign((const char *) data.data() + offset, (size_t) size);
+    offset += (size_t) size;
+    return true;
+}
+
+static bool prefix_cache_decode_identity(const std::vector<uint8_t> & data, size_t & offset, prefix_cache_file_identity & identity) {
+    if (!prefix_cache_read_string(data, offset, identity.path) ||
+        !prefix_cache_read_u64(data, offset, identity.size) ||
+        !prefix_cache_read_u64(data, offset, identity.mtime_ns) ||
+        !prefix_cache_read_u64(data, offset, identity.device) ||
+        !prefix_cache_read_u64(data, offset, identity.inode)) {
+        return false;
+    }
+    return true;
+}
+
+static bool prefix_cache_decode_memo_record(const std::vector<uint8_t> & data,
+                                            const prefix_cache_file_identity & identity,
+                                            std::array<uint8_t, 32> & digest) {
+    static constexpr char MAGIC[] = "LLAMA-PC-DIGEST";
+    if (data.size() < sizeof(MAGIC) - 1 + sizeof(uint32_t)) return false;
+    if (std::memcmp(data.data(), MAGIC, sizeof(MAGIC) - 1) != 0) return false;
+    size_t offset = sizeof(MAGIC) - 1;
+    uint32_t version = 0;
+    if (!prefix_cache_read_u32(data, offset, version) || version != 1) return false;
+    prefix_cache_file_identity stored;
+    if (!prefix_cache_decode_identity(data, offset, stored) || !(stored == identity) ||
+        data.size() - offset != digest.size()) return false;
+    std::copy(data.begin() + (ptrdiff_t) offset, data.end(), digest.begin());
+    return true;
+}
+
+static std::filesystem::path prefix_cache_digest_dir(const std::string & cache_root) {
+    return std::filesystem::path(cache_root) / ".digest-v1";
+}
+
+#if !defined(_WIN32)
+static bool prefix_cache_open_digest_dir(const std::string & cache_root, bool create, int & root_fd, int & digest_fd) {
+    root_fd = -1;
+    digest_fd = -1;
+    root_fd = ::open(cache_root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0 && create && errno == ENOENT) {
+        std::error_code ec;
+        std::filesystem::create_directories(cache_root, ec);
+        if (ec) return false;
+        root_fd = ::open(cache_root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (root_fd < 0) return false;
+
+    digest_fd = ::openat(root_fd, ".digest-v1", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (digest_fd < 0 && create && errno == ENOENT) {
+        if (::mkdirat(root_fd, ".digest-v1", 0700) != 0 && errno != EEXIST) {
+            ::close(root_fd);
+            root_fd = -1;
+            return false;
+        }
+        digest_fd = ::openat(root_fd, ".digest-v1", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (digest_fd < 0) {
+        ::close(root_fd);
+        root_fd = -1;
+        return false;
+    }
+    return true;
+}
+
+static bool prefix_cache_read_digest_fd(int digest_fd, const std::string & name, std::vector<uint8_t> & data) {
+    const int fd = ::openat(digest_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st {};
+    const bool regular = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && st.st_size <= 64 * 1024;
+    if (!regular) {
+        ::close(fd);
+        return false;
+    }
+    data.resize((size_t) st.st_size);
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const ssize_t n = ::pread(fd, data.data() + offset, data.size() - offset, (off_t) offset);
+        if (n <= 0) {
+            ::close(fd);
+            return false;
+        }
+        offset += (size_t) n;
+    }
+    ::close(fd);
+    return true;
+}
+
+static bool prefix_cache_write_digest_fd(int digest_fd, const std::string & name, const std::vector<uint8_t> & data) {
+    static std::atomic<uint64_t> memo_serial{ 0 };
+    const std::string temp_name = name + ".tmp." + std::to_string((unsigned long long) ::getpid()) +
+                                  "." + std::to_string(memo_serial.fetch_add(1, std::memory_order_relaxed));
+    const int fd = ::openat(digest_fd, temp_name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const ssize_t n = ::write(fd, data.data() + offset, data.size() - offset);
+        if (n <= 0) {
+            ::close(fd);
+            ::unlinkat(digest_fd, temp_name.c_str(), 0);
+            return false;
+        }
+        offset += (size_t) n;
+    }
+    if (::fsync(fd) != 0 || ::close(fd) != 0) {
+        ::unlinkat(digest_fd, temp_name.c_str(), 0);
+        return false;
+    }
+
+    // linkat is the no-replace primitive: an existing (possibly stale) memo
+    // wins this race, and the next load will safely recompute if it is bad.
+    const bool linked = ::linkat(digest_fd, temp_name.c_str(), digest_fd, name.c_str(), 0) == 0;
+    const int link_errno = errno;
+    ::unlinkat(digest_fd, temp_name.c_str(), 0);
+    if (!linked && link_errno != EEXIST) return false;
+    return ::fsync(digest_fd) == 0;
+}
+#endif
+
+static bool prefix_cache_load_memo(const std::string & cache_root,
+                                   const prefix_cache_file_identity & identity,
+                                   std::array<uint8_t, 32> & digest) {
+    if (cache_root.empty()) return false;
+    std::vector<uint8_t> key_bytes;
+    prefix_cache_append_u32(key_bytes, 1);
+    prefix_cache_append_identity(key_bytes, identity);
+    const auto key = server_prefix_cache::signature_key(key_bytes).hex();
+#if !defined(_WIN32)
+    int root_fd = -1;
+    int digest_fd = -1;
+    if (!prefix_cache_open_digest_dir(cache_root, false, root_fd, digest_fd)) return false;
+    std::vector<uint8_t> data;
+    const bool read = prefix_cache_read_digest_fd(digest_fd, key + ".bin", data);
+    ::close(digest_fd);
+    ::close(root_fd);
+    return read && prefix_cache_decode_memo_record(data, identity, digest);
+#else
+    const auto path = prefix_cache_digest_dir(cache_root) / (key + ".bin");
+    try {
+        std::error_code root_ec;
+        const auto root_status = std::filesystem::symlink_status(cache_root, root_ec);
+        if (!root_ec && (root_status.type() == std::filesystem::file_type::symlink ||
+                         (!std::filesystem::is_directory(root_status) && std::filesystem::exists(root_status)))) {
+            return false;
+        }
+        const auto dir_status = std::filesystem::symlink_status(path.parent_path());
+        if (!std::filesystem::is_directory(dir_status)) return false;
+        const auto status = std::filesystem::symlink_status(path);
+        if (!std::filesystem::is_regular_file(status)) return false;
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return false;
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        return prefix_cache_decode_memo_record(data, identity, digest);
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+static bool prefix_cache_save_memo(const std::string & cache_root,
+                                   const prefix_cache_file_identity & identity,
+                                   const std::array<uint8_t, 32> & digest) {
+    if (cache_root.empty()) return false;
+
+    std::vector<uint8_t> data;
+    static constexpr char MAGIC[] = "LLAMA-PC-DIGEST";
+    data.insert(data.end(), MAGIC, MAGIC + sizeof(MAGIC) - 1);
+    prefix_cache_append_u32(data, 1);
+    prefix_cache_append_identity(data, identity);
+    data.insert(data.end(), digest.begin(), digest.end());
+
+    std::vector<uint8_t> key_bytes;
+    prefix_cache_append_u32(key_bytes, 1);
+    prefix_cache_append_identity(key_bytes, identity);
+    const auto key = server_prefix_cache::signature_key(key_bytes).hex();
+#if !defined(_WIN32)
+    int root_fd = -1;
+    int digest_fd = -1;
+    if (!prefix_cache_open_digest_dir(cache_root, true, root_fd, digest_fd)) return false;
+    const bool result = prefix_cache_write_digest_fd(digest_fd, key + ".bin", data);
+    ::close(digest_fd);
+    ::close(root_fd);
+    return result;
+#else
+    try {
+        std::error_code root_ec;
+        const auto root_status = std::filesystem::symlink_status(cache_root, root_ec);
+        if (!root_ec && (root_status.type() == std::filesystem::file_type::symlink ||
+                         (!std::filesystem::is_directory(root_status) && std::filesystem::exists(root_status)))) {
+            return false;
+        }
+        const auto dir = prefix_cache_digest_dir(cache_root);
+        std::filesystem::create_directories(dir);
+        const auto dir_status = std::filesystem::symlink_status(dir);
+        if (!std::filesystem::is_directory(dir_status)) return false;
+
+        const auto target = dir / (key + ".bin");
+        const auto target_status = std::filesystem::symlink_status(target);
+        if (target_status.type() == std::filesystem::file_type::symlink) return false;
+
+        static std::atomic<uint64_t> memo_serial{ 0 };
+        const auto tmp = dir / (key + ".tmp." + std::to_string((unsigned long long) ggml_time_us()) +
+                                "." + std::to_string(memo_serial.fetch_add(1, std::memory_order_relaxed)));
+        {
+            std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+            if (!file) return false;
+            file.write((const char *) data.data(), (std::streamsize) data.size());
+            file.flush();
+            if (!file) return false;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, target, ec);
+        if (ec) {
+            std::filesystem::remove(tmp);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+static bool prefix_cache_append_file_digest(std::vector<uint8_t> & out, const std::string & raw_path,
+                                             const std::string & cache_root) {
+    // A model can be replaced in place while the server is starting.  Read
+    // at most twice, and only publish a digest when the identity before and
+    // after the read (or memo lookup) is identical.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        prefix_cache_file_identity identity;
+        if (!prefix_cache_file_identity_for(raw_path, identity)) return false;
+
+        std::array<uint8_t, 32> digest_bytes{};
+        if (prefix_cache_load_memo(cache_root, identity, digest_bytes)) {
+            prefix_cache_file_identity after;
+            if (!prefix_cache_file_identity_for(raw_path, after)) return false;
+            if (after == identity) {
+                prefix_cache_append_identity(out, identity);
+                out.insert(out.end(), digest_bytes.begin(), digest_bytes.end());
+                return true;
+            }
+            continue;
+        }
+
+        prefix_cache_sha256 digest;
+        std::ifstream file(identity.path, std::ios::binary);
+        if (!file) return false;
+        std::array<uint8_t, 1024 * 1024> chunk{};
+        while (file) {
+            file.read((char *) chunk.data(), (std::streamsize) chunk.size());
+            const auto got = file.gcount();
+            if (got > 0) digest.update(chunk.data(), (size_t) got);
+        }
+        if (file.bad()) return false;
+        digest_bytes = digest.finish();
+
+        prefix_cache_file_identity after;
+        if (!prefix_cache_file_identity_for(raw_path, after)) return false;
+        if (!(after == identity)) continue;
+
+        // A failed memo write does not make the computed digest unsafe.  The
+        // cache remains correct; a later startup can recompute it.
+        prefix_cache_save_memo(cache_root, identity, digest_bytes);
+        prefix_cache_append_identity(out, identity);
+        out.insert(out.end(), digest_bytes.begin(), digest_bytes.end());
+        return true;
+    }
+    return false;
+}
+
+static bool prefix_cache_append_model_files(std::vector<uint8_t> & out, const std::string & raw_path,
+                                            const std::string & cache_root) {
+    std::filesystem::path path;
+    try {
+        path = std::filesystem::weakly_canonical(std::filesystem::path(raw_path));
+    } catch (...) {
+        path = std::filesystem::path(raw_path);
+    }
+
+    // GGUF split files use the stable `-00001-of-000NN` suffix.  Include the
+    // complete set, and fail closed if a shard is missing or unreadable.
+    const std::string filename = path.filename().string();
+    static const std::regex split_re("^(.*)-([0-9]{5})-of-([0-9]{5})(\\.[^/]*)$");
+    std::smatch match;
+    if (std::regex_match(filename, match, split_re)) {
+        const std::string stem = match[1].str();
+        const int total = std::stoi(match[3].str());
+        const std::string ext = match[4].str();
+        for (int i = 1; i <= total; ++i) {
+            std::ostringstream shard;
+            shard << stem << "-" << std::setfill('0') << std::setw(5) << i
+                  << "-of-" << std::setfill('0') << std::setw(5) << total << ext;
+            if (!prefix_cache_append_file_digest(out, (path.parent_path() / shard.str()).string(), cache_root)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return prefix_cache_append_file_digest(out, path.string(), cache_root);
+}
+
+static bool make_prefix_cache_signature(const common_params & params, server_prefix_cache::Key & result) {
+    // Keep the signature canonical and independent of aliases, slot IDs, and
+    // request IDs.  The model file identity is included so a replacement at
+    // the same path cannot reuse an old namespace.
+    std::vector<uint8_t> canonical;
+    prefix_cache_append_u32(canonical, server_prefix_cache::FORMAT_VERSION);
+    if (!prefix_cache_append_model_files(canonical, params.model.path, params.cache_disk_path)) {
+        return false;
+    }
+    prefix_cache_append_u32(canonical, params.n_ctx);
+    prefix_cache_append_u32(canonical, params.n_batch);
+    prefix_cache_append_u32(canonical, params.n_ubatch);
+    prefix_cache_append_u32(canonical, params.cache_block_size);
+    prefix_cache_append_u32(canonical, (uint32_t) params.cache_type_k);
+    prefix_cache_append_u32(canonical, (uint32_t) params.cache_type_v);
+    prefix_cache_append_u32(canonical, params.swa_full ? 1u : 0u);
+    prefix_cache_append_u32(canonical, params.kv_unified ? 1u : 0u);
+    prefix_cache_append_u32(canonical, (uint32_t) params.rope_scaling_type);
+    prefix_cache_append_u64(canonical, prefix_cache_float_bits(params.rope_freq_base));
+    prefix_cache_append_u64(canonical, prefix_cache_float_bits(params.rope_freq_scale));
+    if (!params.mmproj.path.empty()) {
+        if (!prefix_cache_append_model_files(canonical, params.mmproj.path, params.cache_disk_path)) {
+            return false;
+        }
+    } else {
+        prefix_cache_append_string(canonical, "");
+    }
+    for (const auto & lora : params.lora_adapters) {
+        if (!prefix_cache_append_model_files(canonical, lora.path, params.cache_disk_path)) {
+            return false;
+        }
+        prefix_cache_append_u64(canonical, prefix_cache_float_bits(lora.scale));
+    }
+    for (const auto & control : params.control_vectors) {
+        if (!prefix_cache_append_model_files(canonical, control.fname, params.cache_disk_path)) {
+            return false;
+        }
+        prefix_cache_append_u64(canonical, prefix_cache_float_bits(control.strength));
+    }
+    result = server_prefix_cache::signature_key(canonical);
+    return true;
+}
+
+} // namespace
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -230,6 +780,33 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    size_t prefix_cache_last_captured_boundary = 0;
+    size_t prefix_cache_request_captured_boundary = 0;
+
+    struct prefix_cache_deferred_capture {
+        server_prefix_cache::Artifact attention;
+        std::optional<server_prefix_cache::Artifact> recurrent;
+        std::optional<server_prefix_cache::PrefixCacheStore::Reservation> recurrent_reservation;
+        size_t boundary = 0;
+        uint64_t slot_generation = 0;
+        bool materialized = false;
+    };
+
+    struct prefix_cache_request_state {
+        bool requested = false;
+        bool eligible = false;
+        int32_t staged_blocks = 0;
+        int32_t published_blocks = 0;
+        int32_t recurrent_sidecars = 0;
+        bool durable = false;
+        std::string reason;
+    };
+
+    uint64_t prefix_cache_generation = 0;
+    std::vector<prefix_cache_deferred_capture> prefix_cache_deferred;
+    std::unordered_set<server_prefix_cache::Key, server_prefix_cache::KeyHash> prefix_cache_observed;
+    std::unordered_set<server_prefix_cache::Key, server_prefix_cache::KeyHash> prefix_cache_admitted;
+    prefix_cache_request_state prefix_cache_state;
 
     size_t last_nl_pos = 0;
 
@@ -293,6 +870,17 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        // A cleared sequence no longer contains any state that has been
+        // published by the persistent prefix cache.  Keep this tracker in
+        // lockstep with the resident sequence so the next request retries
+        // the first complete block instead of treating stale progress as
+        // already captured.
+        prefix_cache_last_captured_boundary = 0;
+        prefix_cache_request_captured_boundary = 0;
+        prefix_cache_deferred.clear();
+        prefix_cache_observed.clear();
+        prefix_cache_admitted.clear();
+        ++prefix_cache_generation;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -335,7 +923,12 @@ struct server_slot {
         spec_is_replay = false;
 
         n_prompt_tokens_cache = 0;
-
+        prefix_cache_deferred.clear();
+        prefix_cache_observed.clear();
+        prefix_cache_admitted.clear();
+        prefix_cache_request_captured_boundary = 0;
+        prefix_cache_state = {};
+        ++prefix_cache_generation;
         last_nl_pos    = 0;
         generated_text = "";
         has_new_line   = false;
@@ -900,6 +1493,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -970,6 +1564,45 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_prefix_cache::PrefixCacheStore> prefix_cache;
+    server_prefix_cache::Key prefix_cache_signature{};
+
+    struct prefix_cache_metrics {
+        uint64_t eligible_requests = 0;
+        uint64_t ineligible_requests = 0;
+        uint64_t lookup_attempts = 0;
+        uint64_t walkbacks = 0;
+        uint64_t boundaries_observed = 0;
+        uint64_t first_observations = 0;
+        uint64_t repeat_admissions = 0;
+        uint64_t explicit_admissions = 0;
+        uint64_t admission_lru_evictions = 0;
+        uint64_t explicit_precache_requests = 0;
+        uint64_t explicit_precache_successes = 0;
+        uint64_t explicit_precache_failures = 0;
+        uint64_t restore_failures = 0;
+        uint64_t capture_attempts = 0;
+        uint64_t capture_skips = 0;
+        uint64_t recurrent_stages = 0;
+        uint64_t recurrent_stage_bytes = 0;
+        uint64_t deferred_attention_materializations = 0;
+        uint64_t dropped_deferred_descriptors = 0;
+        uint64_t dropped_deferred_slot_mismatch = 0;
+        uint64_t dropped_deferred_backpressure = 0;
+        uint64_t dropped_deferred_serialization = 0;
+        uint64_t tokens_restored = 0;
+        uint64_t tokens_evaluated_after_restore = 0;
+        uint64_t lookup_us = 0;
+        uint64_t restore_us = 0;
+        uint64_t capture_us = 0;
+        uint64_t materialize_us = 0;
+        uint64_t serialize_us = 0;
+        uint64_t queue_us = 0;
+        std::map<std::string, uint64_t> ineligible_reasons;
+    } prefix_cache_metrics;
+
+    std::unique_ptr<server_prefix_cache::PrefixAdmission> prefix_cache_admission;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -985,7 +1618,783 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    bool prefix_cache_enabled() const {
+        return prefix_cache != nullptr;
+    }
+
+    static const char * prefix_cache_capture_mode_name(common_params::cache_capture_mode_type mode) {
+        switch (mode) {
+            case common_params::CACHE_CAPTURE_MODE_ALWAYS:
+                return "always";
+            case common_params::CACHE_CAPTURE_MODE_REPEAT:
+                return "repeat";
+            case common_params::CACHE_CAPTURE_MODE_EXPLICIT:
+                return "explicit";
+        }
+        return "repeat";
+    }
+
+    json prefix_cache_json() const {
+        size_t deferred_items = 0;
+        for (const auto & slot : slots) {
+            deferred_items += slot.prefix_cache_deferred.size();
+        }
+        const auto admission_stats = prefix_cache_admission
+            ? prefix_cache_admission->stats()
+            : server_prefix_cache::AdmissionStats{};
+        json result = {
+            { "enabled", !params_base.cache_disk_path.empty() },
+            { "disk_path", params_base.cache_disk_path },
+            { "disk_size_mib", params_base.cache_disk_size_mib },
+            { "block_size", params_base.cache_block_size },
+            { "write_buffer_mib", params_base.cache_write_buffer_mib },
+            { "hot_size_mib", params_base.cache_ram_mib },
+            { "capture_mode", prefix_cache_capture_mode_name(params_base.cache_capture_mode) },
+            { "admission_items", admission_stats.items },
+            { "admission_capacity", admission_stats.capacity },
+            { "recurrent_stride", params_base.cache_recurrent_stride },
+            { "deferred_items", deferred_items },
+            { "deferred_bytes", (uint64_t) deferred_items * sizeof(server_slot::prefix_cache_deferred_capture) },
+            { "eligible_requests", prefix_cache_metrics.eligible_requests },
+            { "ineligible_requests", prefix_cache_metrics.ineligible_requests },
+            { "lookup_attempts", prefix_cache_metrics.lookup_attempts },
+            { "walkbacks", prefix_cache_metrics.walkbacks },
+            { "boundaries_observed", admission_stats.boundaries_observed },
+            { "first_observations", admission_stats.first_observations },
+            { "repeat_admissions", admission_stats.repeat_admissions },
+            { "explicit_admissions", admission_stats.explicit_admissions },
+            { "admission_lru_evictions", admission_stats.lru_evictions },
+            { "explicit_precache_requests", prefix_cache_metrics.explicit_precache_requests },
+            { "explicit_precache_successes", prefix_cache_metrics.explicit_precache_successes },
+            { "explicit_precache_failures", prefix_cache_metrics.explicit_precache_failures },
+            { "restore_failures", prefix_cache_metrics.restore_failures },
+            { "capture_attempts", prefix_cache_metrics.capture_attempts },
+            { "capture_skips", prefix_cache_metrics.capture_skips },
+            { "recurrent_stages", prefix_cache_metrics.recurrent_stages },
+            { "recurrent_stage_bytes", prefix_cache_metrics.recurrent_stage_bytes },
+            { "deferred_attention_materializations", prefix_cache_metrics.deferred_attention_materializations },
+            { "dropped_deferred_descriptors", prefix_cache_metrics.dropped_deferred_descriptors },
+            { "dropped_deferred_slot_mismatch", prefix_cache_metrics.dropped_deferred_slot_mismatch },
+            { "dropped_deferred_backpressure", prefix_cache_metrics.dropped_deferred_backpressure },
+            { "dropped_deferred_serialization", prefix_cache_metrics.dropped_deferred_serialization },
+            { "tokens_restored", prefix_cache_metrics.tokens_restored },
+            { "tokens_evaluated_after_restore", prefix_cache_metrics.tokens_evaluated_after_restore },
+            { "lookup_us", prefix_cache_metrics.lookup_us },
+            { "restore_us", prefix_cache_metrics.restore_us },
+            { "capture_us", prefix_cache_metrics.capture_us },
+            { "materialize_us", prefix_cache_metrics.materialize_us },
+            { "serialize_us", prefix_cache_metrics.serialize_us },
+            { "queue_us", prefix_cache_metrics.queue_us },
+            { "ineligible_reasons", prefix_cache_metrics.ineligible_reasons },
+        };
+        if (prefix_cache) {
+            const auto stats = prefix_cache->stats();
+            result["store"] = {
+                { "lookups", stats.lookups },
+                { "attention_lookups", stats.attention_lookups },
+                { "recurrent_lookups", stats.recurrent_lookups },
+                { "hot_hits", stats.hot_hits },
+                { "attention_hot_hits", stats.attention_hot_hits },
+                { "recurrent_hot_hits", stats.recurrent_hot_hits },
+                { "disk_hits", stats.disk_hits },
+                { "attention_disk_hits", stats.attention_disk_hits },
+                { "recurrent_disk_hits", stats.recurrent_disk_hits },
+                { "misses", stats.misses },
+                { "attention_misses", stats.attention_misses },
+                { "recurrent_misses", stats.recurrent_misses },
+                { "corrupt", stats.corrupt },
+                { "incompatible", stats.incompatible },
+                { "published", stats.published },
+                { "bytes_read", stats.bytes_read },
+                { "bytes_written", stats.bytes_written },
+                { "hot_bytes", stats.hot_bytes },
+                { "hot_artifacts", stats.hot_artifacts },
+                { "disk_bytes", stats.disk_bytes },
+                { "disk_artifacts", stats.disk_artifacts },
+                { "disk_io_inflight", stats.disk_io_inflight },
+                { "pending_write_bytes", stats.pending_write_bytes },
+                { "pending_write_peak_bytes", stats.pending_write_peak_bytes },
+                { "pending_write_items", stats.pending_write_items },
+                { "pending_write_capacity", stats.pending_write_capacity },
+                { "reserved_hot_bytes", stats.reserved_hot_bytes },
+            };
+        }
+        return result;
+    }
+
+    bool prefix_cache_clear_hot() const {
+        if (!prefix_cache) {
+            return false;
+        }
+        prefix_cache->clear_hot();
+        return true;
+    }
+
+    bool prefix_cache_clear_disk(std::string * error = nullptr) const {
+        return prefix_cache && prefix_cache->clear_disk(error);
+    }
+
+    bool prefix_cache_flush(std::chrono::milliseconds timeout) const {
+        return prefix_cache && prefix_cache->flush(timeout);
+    }
+
+    bool prefix_cache_request_eligible(const server_slot & slot, const server_tokens & tokens, std::string * reason = nullptr) const {
+        auto reject = [&](const char * why) {
+            if (reason) {
+                *reason = why;
+            }
+            return false;
+        };
+
+        if (!prefix_cache) {
+            return reject("disabled");
+        }
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return reject("task_type");
+        }
+        if (!slot.task->params.cache_prompt) {
+            return reject("prompt_cache_disabled");
+        }
+        if (tokens.has_media() || tokens.has_mtmd) {
+            return reject("media");
+        }
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i] == LLAMA_TOKEN_NULL) {
+                return reject("media_token");
+            }
+        }
+        if (params_base.ctx_shift) {
+            return reject("context_shift");
+        }
+        if (n_swa > 0) {
+            return reject("swa");
+        }
+        if (spec) {
+            return reject("speculative");
+        }
+        if (slot.alora_invocation_start >= 0 || lora_all_alora(slot.lora)) {
+            return reject("alora");
+        }
+        if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
+            return reject("adapter_change");
+        }
+
+        const uint32_t components = llama_state_seq_components(ctx_tgt);
+        const uint32_t capabilities = llama_state_seq_capabilities(ctx_tgt);
+        const uint32_t required_attention =
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION |
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE |
+            LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE;
+        if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
+            (capabilities & required_attention) != required_attention) {
+            return reject("attention_range_unsupported");
+        }
+        if (params_base.kv_unified &&
+            (capabilities & LLAMA_STATE_SEQ_CAPABILITY_UNIFIED_KV_RESTORE) == 0) {
+            return reject("unified_kv_restore_unsupported");
+        }
+        if ((components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0) {
+            const uint32_t required_recurrent =
+                LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE |
+                LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE;
+            if ((capabilities & required_recurrent) != required_recurrent) {
+                return reject("recurrent_boundary_unsupported");
+            }
+        }
+
+        return true;
+    }
+
+    llama_state_seq_flags prefix_cache_state_flags() const {
+        const uint32_t capabilities = llama_state_seq_capabilities(ctx_tgt);
+        return (capabilities & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE) != 0
+            ? (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT
+            : (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_NONE;
+    }
+
+    static std::vector<int32_t> prefix_cache_positions(llama_pos p0, llama_pos p1) {
+        std::vector<int32_t> positions;
+        if (p1 <= p0) {
+            return positions;
+        }
+        positions.reserve((size_t) (p1 - p0));
+        for (llama_pos p = p0; p < p1; ++p) {
+            positions.push_back(p);
+        }
+        return positions;
+    }
+
+    std::vector<server_prefix_cache::Key> prefix_cache_attention_keys(const std::vector<llama_token> & tokens, size_t n_blocks) const {
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        std::vector<server_prefix_cache::Key> keys;
+        keys.reserve(n_blocks);
+        for (size_t block = 0; block < n_blocks; ++block) {
+            const size_t p0 = block * block_size;
+            const size_t p1 = p0 + block_size;
+            std::vector<int32_t> block_tokens;
+            block_tokens.reserve(block_size);
+            for (size_t i = p0; i < p1; ++i) {
+                block_tokens.push_back(tokens[i]);
+            }
+            const auto positions = prefix_cache_positions((llama_pos) p0, (llama_pos) p1);
+            const std::optional<server_prefix_cache::Key> parent = block == 0
+                ? std::nullopt
+                : std::optional<server_prefix_cache::Key>(keys.back());
+            keys.push_back(server_prefix_cache::chain_key(prefix_cache_signature,
+                                                          server_prefix_cache::ArtifactKind::ATTENTION,
+                                                          parent, positions, block_tokens));
+        }
+        return keys;
+    }
+
+    server_prefix_cache::Key prefix_cache_recurrent_key(const server_prefix_cache::Key & attention_key) const {
+        const std::vector<int32_t> empty;
+        return server_prefix_cache::chain_key(prefix_cache_signature,
+                                               server_prefix_cache::ArtifactKind::RECURRENT,
+                                               std::optional<server_prefix_cache::Key>(attention_key),
+                                               empty, empty);
+    }
+
+    int32_t prefix_cache_restore(server_slot & slot, const server_tokens & input_tokens) {
+        const int64_t t_restore_start = ggml_time_us();
+        auto restore_done = [&](int32_t value) {
+            prefix_cache_metrics.restore_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_restore_start);
+            return value;
+        };
+        auto lookup = [&](server_prefix_cache::ArtifactKind kind, const server_prefix_cache::Key & key) {
+            const int64_t t_lookup_start = ggml_time_us();
+            auto result = prefix_cache->lookup(kind, key);
+            prefix_cache_metrics.lookup_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_lookup_start);
+            return result;
+        };
+        std::string reason;
+        if (!prefix_cache_request_eligible(slot, input_tokens, &reason)) {
+            prefix_cache_metrics.ineligible_requests++;
+            prefix_cache_metrics.ineligible_reasons[reason]++;
+            return restore_done(0);
+        }
+
+        const auto & tokens = input_tokens.get_tokens();
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        const size_t n_blocks = tokens.size() / block_size;
+        if (n_blocks == 0) {
+            return restore_done(0);
+        }
+
+        prefix_cache_metrics.eligible_requests++;
+        prefix_cache_metrics.lookup_attempts++;
+        const llama_state_seq_flags state_flags = prefix_cache_state_flags();
+        const auto attention_keys = prefix_cache_attention_keys(tokens, n_blocks);
+
+        const bool has_recurrent = (llama_state_seq_components(ctx_tgt) & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0;
+        auto valid_attention = [&](const server_prefix_cache::Artifact & artifact, size_t block) {
+            return artifact.signature == prefix_cache_signature &&
+                artifact.position_start == (int64_t) (block * block_size) &&
+                artifact.position_end == (int64_t) ((block + 1) * block_size) &&
+                artifact.token_count == block_size &&
+                (block == 0
+                    ? !artifact.has_parent
+                    : artifact.has_parent && artifact.parent == attention_keys[block - 1]);
+        };
+
+        // Discover the contiguous attention chain once.  Walkback then only
+        // probes recurrent sidecars, avoiding O(n^2) tail-miss lookups.
+        size_t contiguous = 0;
+        while (contiguous < n_blocks) {
+            auto artifact = lookup(server_prefix_cache::ArtifactKind::ATTENTION,
+                                   attention_keys[contiguous]);
+            if (!artifact || !valid_attention(*artifact, contiguous)) {
+                break;
+            }
+            ++contiguous;
+        }
+        const size_t max_candidate = std::min(contiguous, (tokens.size() - 1) / block_size);
+        for (size_t candidate = max_candidate; candidate > 0; --candidate) {
+            const size_t boundary = candidate * block_size;
+            bool chain_ok = true;
+
+            std::optional<server_prefix_cache::Artifact> recurrent;
+            if (chain_ok && has_recurrent) {
+                const auto key = prefix_cache_recurrent_key(attention_keys[candidate - 1]);
+                recurrent = lookup(server_prefix_cache::ArtifactKind::RECURRENT, key);
+                if (!recurrent || recurrent->signature != prefix_cache_signature ||
+                    !recurrent->has_parent || recurrent->parent != attention_keys[candidate - 1] ||
+                    recurrent->position_start != 0 || recurrent->position_end != (int64_t) boundary ||
+                    recurrent->token_count != boundary) {
+                    chain_ok = false;
+                }
+            }
+            if (!chain_ok) {
+                if (candidate != max_candidate) {
+                    prefix_cache_metrics.walkbacks++;
+                }
+                continue;
+            }
+
+            slot.mem.seq_rm(slot.id, -1, -1);
+            bool restored = true;
+            for (size_t block = 0; block < candidate; ++block) {
+                // Re-read one immutable artifact at a time. This keeps
+                // restore staging bounded by the largest block payload rather
+                // than by the complete prefix length.
+                auto artifact = lookup(server_prefix_cache::ArtifactKind::ATTENTION, attention_keys[block]);
+                if (!artifact || !valid_attention(*artifact, block)) {
+                    restored = false;
+                    break;
+                }
+                const llama_state_seq_range range { (llama_pos) artifact->position_start, (llama_pos) artifact->position_end };
+                const size_t consumed = llama_state_seq_set_data_range(
+                    ctx_tgt, artifact->payload.data(), artifact->payload.size(), slot.id,
+                    LLAMA_STATE_SEQ_COMPONENT_ATTENTION, range, state_flags);
+                if (consumed != artifact->payload.size()) {
+                    restored = false;
+                    break;
+                }
+            }
+            if (restored && recurrent) {
+                const llama_state_seq_range range { 0, (llama_pos) boundary };
+                const size_t consumed = llama_state_seq_set_data_range(
+                    ctx_tgt, recurrent->payload.data(), recurrent->payload.size(), slot.id,
+                    LLAMA_STATE_SEQ_COMPONENT_RECURRENT, range, LLAMA_STATE_SEQ_FLAGS_NONE);
+                restored = consumed == recurrent->payload.size();
+            }
+
+            if (!restored || llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != (llama_pos) boundary - 1) {
+                slot.mem.seq_rm(slot.id, -1, -1);
+                prefix_cache_metrics.restore_failures++;
+                prefix_cache->stats();
+                continue;
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens.insert(llama_tokens(tokens.begin(), tokens.begin() + boundary));
+            slot.prompt.checkpoints.clear();
+            // The restored sequence is known to contain complete blocks up to
+            // this boundary.  Preserve that fact across slot release so a
+            // later in-memory LCP reuse does not attempt to reserialize old
+            // recurrent ranges that are no longer at the live boundary.
+            slot.prefix_cache_last_captured_boundary = boundary;
+            prefix_cache_metrics.tokens_restored += boundary;
+            return restore_done((int32_t) boundary);
+        }
+
+        return restore_done(0);
+    }
+
+    void prefix_cache_prepare_admission(server_slot & slot, const server_tokens & input_tokens) {
+        slot.prefix_cache_observed.clear();
+        slot.prefix_cache_admitted.clear();
+        if (!prefix_cache || !prefix_cache_admission) {
+            return;
+        }
+
+        std::string reason;
+        if (!prefix_cache_request_eligible(slot, input_tokens, &reason)) {
+            slot.prefix_cache_state.eligible = false;
+            slot.prefix_cache_state.reason = reason;
+            return;
+        }
+        slot.prefix_cache_state.eligible = true;
+
+        const auto & tokens = input_tokens.get_tokens();
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        const size_t n_blocks = tokens.size() / block_size;
+        if (n_blocks == 0) {
+            return;
+        }
+
+        const auto attention_keys = prefix_cache_attention_keys(tokens, n_blocks);
+        for (const auto & key : attention_keys) {
+            bool admitted = false;
+            if (slot.task->params.cache_persist) {
+                slot.prefix_cache_state.requested = true;
+                admitted = prefix_cache_admission->observe_explicit(key);
+            } else if (params_base.cache_capture_mode == common_params::CACHE_CAPTURE_MODE_ALWAYS) {
+                admitted = true;
+            } else if (params_base.cache_capture_mode == common_params::CACHE_CAPTURE_MODE_REPEAT) {
+                slot.prefix_cache_observed.insert(key);
+                admitted = prefix_cache_admission->observe_cold(key);
+            }
+
+            if (admitted) {
+                slot.prefix_cache_admitted.insert(key);
+            }
+        }
+    }
+
+    int prefix_cache_adjust_reuse_for_admitted_capture(const server_slot & slot, int n_past) const {
+        if (!prefix_cache || n_past <= 0 || slot.prefix_cache_admitted.empty() ||
+            (llama_state_seq_components(ctx_tgt) & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) == 0) {
+            return n_past;
+        }
+
+        const auto & tokens = slot.task->tokens.get_tokens();
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        const size_t n_blocks = tokens.size() / block_size;
+        if (n_blocks == 0) {
+            return n_past;
+        }
+
+        int adjusted = n_past;
+        const size_t deepest_block = n_blocks;
+        const auto attention_keys = prefix_cache_attention_keys(tokens, n_blocks);
+        for (size_t block = 0; block < n_blocks; ++block) {
+            const size_t boundary = (block + 1) * block_size;
+            if (boundary > (size_t) n_past) {
+                break;
+            }
+            if (slot.prefix_cache_admitted.find(attention_keys[block]) == slot.prefix_cache_admitted.end()) {
+                continue;
+            }
+            if (!prefix_cache_needs_recurrent_sidecar(block, deepest_block)) {
+                continue;
+            }
+            adjusted = std::min(adjusted, (int) boundary - 1);
+        }
+
+        return adjusted;
+    }
+
+    bool prefix_cache_boundary_admitted(server_slot & slot, const server_prefix_cache::Key & key) {
+        if (!prefix_cache_admission) {
+            return false;
+        }
+        return slot.prefix_cache_admitted.find(key) != slot.prefix_cache_admitted.end();
+    }
+
+    bool prefix_cache_needs_recurrent_sidecar(size_t block, size_t deepest_block) const {
+        const size_t one_based = block + 1;
+        return one_based == 1 ||
+            one_based == deepest_block ||
+            one_based % (size_t) params_base.cache_recurrent_stride == 0;
+    }
+
+    bool prefix_cache_existing_block_available(
+            const std::vector<server_prefix_cache::Key> & attention_keys,
+            size_t block,
+            size_t deepest_block,
+            bool * has_recurrent_sidecar = nullptr) {
+        if (has_recurrent_sidecar) {
+            *has_recurrent_sidecar = false;
+        }
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        auto attention = prefix_cache->lookup(server_prefix_cache::ArtifactKind::ATTENTION, attention_keys[block]);
+        if (!attention || attention->signature != prefix_cache_signature ||
+            attention->position_start != (int64_t) (block * block_size) ||
+            attention->position_end != (int64_t) ((block + 1) * block_size) ||
+            attention->token_count != block_size ||
+            (block == 0
+                ? attention->has_parent
+                : !attention->has_parent || attention->parent != attention_keys[block - 1])) {
+            return false;
+        }
+
+        if ((llama_state_seq_components(ctx_tgt) & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0 &&
+            prefix_cache_needs_recurrent_sidecar(block, deepest_block)) {
+            auto recurrent = prefix_cache->lookup(server_prefix_cache::ArtifactKind::RECURRENT,
+                                                  prefix_cache_recurrent_key(attention_keys[block]));
+            const size_t boundary = (block + 1) * block_size;
+            if (!recurrent || recurrent->signature != prefix_cache_signature ||
+                !recurrent->has_parent || recurrent->parent != attention_keys[block] ||
+                recurrent->position_start != 0 ||
+                recurrent->position_end != (int64_t) boundary ||
+                recurrent->token_count != boundary) {
+                return false;
+            }
+            if (has_recurrent_sidecar) {
+                *has_recurrent_sidecar = true;
+            }
+        }
+
+        return true;
+    }
+
+    void prefix_cache_forget_admission(const server_prefix_cache::Key & key) {
+        if (prefix_cache_admission) {
+            prefix_cache_admission->published(key);
+        }
+    }
+
+    void prefix_cache_stage_capture(server_slot & slot) {
+        if (!prefix_cache) {
+            return;
+        }
+        const int64_t t_capture_start = ggml_time_us();
+        auto capture_done = [&]() {
+            prefix_cache_metrics.capture_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_capture_start);
+        };
+        std::string reason;
+        if (!prefix_cache_request_eligible(slot, slot.task->tokens, &reason)) {
+            slot.prefix_cache_state.eligible = false;
+            slot.prefix_cache_state.reason = reason;
+            capture_done();
+            return;
+        }
+        slot.prefix_cache_state.eligible = true;
+
+        const size_t block_size = (size_t) params_base.cache_block_size;
+        const auto & tokens = slot.task->tokens.get_tokens();
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        const size_t evaluated_boundary = pos_max < 0 ? 0 : (size_t) pos_max + 1;
+        const size_t prompt_boundary = (slot.task->tokens.size() / block_size) * block_size;
+        const size_t boundary = std::min((evaluated_boundary / block_size) * block_size, prompt_boundary);
+        const size_t captured_boundary = slot.task->params.cache_persist
+            ? slot.prefix_cache_request_captured_boundary
+            : slot.prefix_cache_last_captured_boundary;
+        if (boundary == 0 || boundary <= captured_boundary || boundary > tokens.size()) {
+            capture_done();
+            return;
+        }
+
+        const uint32_t components = llama_state_seq_components(ctx_tgt);
+        const bool has_recurrent = (components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0;
+        const llama_state_seq_flags state_flags = prefix_cache_state_flags();
+        const size_t deepest_block = slot.task->tokens.size() / block_size;
+        const auto attention_keys = prefix_cache_attention_keys(tokens, boundary / block_size);
+
+        for (size_t block = captured_boundary / block_size; block < boundary / block_size; ++block) {
+            const auto & key = attention_keys[block];
+            if (!prefix_cache_boundary_admitted(slot, key)) {
+                continue;
+            }
+
+            bool existing_has_recurrent = false;
+            if (slot.task->params.cache_precache &&
+                prefix_cache_existing_block_available(attention_keys, block, deepest_block, &existing_has_recurrent)) {
+                prefix_cache_metrics.capture_attempts++;
+                slot.prefix_cache_state.published_blocks++;
+                if (existing_has_recurrent) {
+                    slot.prefix_cache_state.recurrent_sidecars++;
+                }
+                slot.prefix_cache_state.durable = true;
+                slot.prefix_cache_state.reason.clear();
+                prefix_cache_forget_admission(key);
+                slot.prefix_cache_request_captured_boundary = (block + 1) * block_size;
+                slot.prefix_cache_last_captured_boundary = (block + 1) * block_size;
+                continue;
+            }
+
+            const llama_state_seq_range range { (llama_pos) (block * block_size), (llama_pos) ((block + 1) * block_size) };
+            const size_t attention_size = llama_state_seq_get_size_range(ctx_tgt, slot.id,
+                LLAMA_STATE_SEQ_COMPONENT_ATTENTION, range, state_flags);
+            if (attention_size == 0) {
+                prefix_cache_metrics.capture_skips++;
+                slot.prefix_cache_state.reason = "attention_size";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(key);
+                }
+                break;
+            }
+
+            server_slot::prefix_cache_deferred_capture deferred;
+            deferred.attention.kind = server_prefix_cache::ArtifactKind::ATTENTION;
+            deferred.attention.signature = prefix_cache_signature;
+            deferred.attention.key = key;
+            if (block > 0) {
+                deferred.attention.parent = attention_keys[block - 1];
+                deferred.attention.has_parent = true;
+            }
+            deferred.attention.position_start = range.p0;
+            deferred.attention.position_end = range.p1;
+            deferred.attention.token_count = block_size;
+            deferred.boundary = range.p1;
+            deferred.slot_generation = slot.prefix_cache_generation;
+
+            if (has_recurrent && prefix_cache_needs_recurrent_sidecar(block, deepest_block)) {
+                const llama_state_seq_range recurrent_range { 0, range.p1 };
+                const size_t recurrent_size = llama_state_seq_get_size_range(ctx_tgt, slot.id,
+                    LLAMA_STATE_SEQ_COMPONENT_RECURRENT, recurrent_range, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (recurrent_size == 0) {
+                    prefix_cache_metrics.capture_skips++;
+                    slot.prefix_cache_state.reason = "recurrent_size";
+                    if (prefix_cache_admission) {
+                        prefix_cache_admission->capture_failed(key);
+                    }
+                    break;
+                }
+                const int64_t t_queue_start = ggml_time_us();
+                auto sidecar_reservation = prefix_cache->reserve(server_prefix_cache::ArtifactKind::RECURRENT, recurrent_size, true);
+                prefix_cache_metrics.queue_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_queue_start);
+                if (!sidecar_reservation || sidecar_reservation->payload_size() < recurrent_size) {
+                    prefix_cache_metrics.capture_skips++;
+                    slot.prefix_cache_state.reason = "recurrent_backpressure";
+                    if (prefix_cache_admission) {
+                        prefix_cache_admission->capture_failed(key);
+                    }
+                    break;
+                }
+
+                server_prefix_cache::Artifact sidecar;
+                sidecar.kind = server_prefix_cache::ArtifactKind::RECURRENT;
+                sidecar.signature = prefix_cache_signature;
+                sidecar.key = prefix_cache_recurrent_key(deferred.attention.key);
+                sidecar.parent = deferred.attention.key;
+                sidecar.has_parent = true;
+                sidecar.position_start = 0;
+                sidecar.position_end = range.p1;
+                sidecar.token_count = range.p1;
+                const int64_t t_sidecar_serialize_start = ggml_time_us();
+                const size_t sidecar_written = llama_state_seq_get_data_range(ctx_tgt, sidecar_reservation->payload_data(), recurrent_size, slot.id,
+                    LLAMA_STATE_SEQ_COMPONENT_RECURRENT, recurrent_range, LLAMA_STATE_SEQ_FLAGS_NONE);
+                prefix_cache_metrics.serialize_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_sidecar_serialize_start);
+                if (sidecar_written != recurrent_size) {
+                    prefix_cache_metrics.capture_skips++;
+                    slot.prefix_cache_state.reason = "recurrent_serialize";
+                    if (prefix_cache_admission) {
+                        prefix_cache_admission->capture_failed(key);
+                    }
+                    break;
+                }
+                deferred.recurrent = sidecar;
+                deferred.recurrent_reservation = std::move(sidecar_reservation);
+                prefix_cache_metrics.recurrent_stages++;
+                prefix_cache_metrics.recurrent_stage_bytes += recurrent_size;
+            }
+
+            prefix_cache_metrics.capture_attempts++;
+            slot.prefix_cache_state.staged_blocks++;
+            slot.prefix_cache_deferred.push_back(std::move(deferred));
+            slot.prefix_cache_request_captured_boundary = range.p1;
+            slot.prefix_cache_last_captured_boundary = range.p1;
+        }
+        capture_done();
+    }
+
+    void prefix_cache_materialize_deferred(server_slot & slot) {
+        if (!prefix_cache || slot.prefix_cache_deferred.empty()) {
+            return;
+        }
+        const int64_t t_materialize_start = ggml_time_us();
+        const llama_state_seq_flags state_flags = prefix_cache_state_flags();
+        for (auto & deferred : slot.prefix_cache_deferred) {
+            if (deferred.slot_generation != slot.prefix_cache_generation ||
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) < (llama_pos) deferred.boundary - 1) {
+                prefix_cache_metrics.dropped_deferred_descriptors++;
+                prefix_cache_metrics.dropped_deferred_slot_mismatch++;
+                slot.prefix_cache_state.reason = "slot_changed";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(deferred.attention.key);
+                }
+                continue;
+            }
+
+            const llama_state_seq_range range {
+                (llama_pos) deferred.attention.position_start,
+                (llama_pos) deferred.attention.position_end
+            };
+            const size_t attention_size = llama_state_seq_get_size_range(ctx_tgt, slot.id,
+                LLAMA_STATE_SEQ_COMPONENT_ATTENTION, range, state_flags);
+            if (attention_size == 0) {
+                prefix_cache_metrics.dropped_deferred_descriptors++;
+                prefix_cache_metrics.dropped_deferred_serialization++;
+                slot.prefix_cache_state.reason = "attention_size";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(deferred.attention.key);
+                }
+                continue;
+            }
+
+            const int64_t t_queue_start = ggml_time_us();
+            auto reservation = prefix_cache->reserve(server_prefix_cache::ArtifactKind::ATTENTION, attention_size, true);
+            prefix_cache_metrics.queue_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_queue_start);
+            if (!reservation || reservation->payload_size() < attention_size) {
+                prefix_cache_metrics.dropped_deferred_descriptors++;
+                prefix_cache_metrics.dropped_deferred_backpressure++;
+                slot.prefix_cache_state.reason = "attention_backpressure";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(deferred.attention.key);
+                }
+                continue;
+            }
+
+            const int64_t t_serialize_start = ggml_time_us();
+            const size_t written = llama_state_seq_get_data_range(ctx_tgt, reservation->payload_data(), attention_size, slot.id,
+                LLAMA_STATE_SEQ_COMPONENT_ATTENTION, range, state_flags);
+            prefix_cache_metrics.serialize_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_serialize_start);
+            if (written != attention_size) {
+                prefix_cache_metrics.dropped_deferred_descriptors++;
+                prefix_cache_metrics.dropped_deferred_serialization++;
+                slot.prefix_cache_state.reason = "attention_serialize";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(deferred.attention.key);
+                }
+                continue;
+            }
+
+            const int64_t t_commit_start = ggml_time_us();
+            const bool attention_committed = reservation->commit(deferred.attention);
+            bool recurrent_committed = true;
+            if (attention_committed && deferred.recurrent && deferred.recurrent_reservation) {
+                recurrent_committed = deferred.recurrent_reservation->commit(*deferred.recurrent);
+            }
+            prefix_cache_metrics.queue_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_commit_start);
+            if (!attention_committed || !recurrent_committed) {
+                prefix_cache_metrics.dropped_deferred_descriptors++;
+                slot.prefix_cache_state.reason = "commit";
+                if (prefix_cache_admission) {
+                    prefix_cache_admission->capture_failed(deferred.attention.key);
+                }
+                continue;
+            }
+
+            deferred.materialized = true;
+            slot.prefix_cache_state.published_blocks++;
+            if (deferred.recurrent) {
+                slot.prefix_cache_state.recurrent_sidecars++;
+            }
+            slot.prefix_cache_state.reason.clear();
+            prefix_cache_metrics.deferred_attention_materializations++;
+            prefix_cache_forget_admission(deferred.attention.key);
+        }
+        slot.prefix_cache_state.durable = slot.prefix_cache_state.published_blocks > 0;
+        slot.prefix_cache_deferred.clear();
+        prefix_cache_metrics.materialize_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_materialize_start);
+    }
+
+    bool init_prefix_cache() {
+        if (params_base.cache_disk_path.empty()) {
+            return true;
+        }
+
+        server_prefix_cache::Options options;
+        options.root = params_base.cache_disk_path;
+        if (!make_prefix_cache_signature(params_base, prefix_cache_signature)) {
+            SRV_ERR("%s", "failed to compute persistent prefix-cache model signature; refusing unsafe cache startup\n");
+            return false;
+        }
+        options.signature = prefix_cache_signature;
+        options.hot_bytes = params_base.cache_ram_mib < 0
+            ? std::numeric_limits<uint64_t>::max()
+            : (uint64_t) params_base.cache_ram_mib * 1024ull * 1024ull;
+        options.disk_bytes = (uint64_t) params_base.cache_disk_size_mib * 1024ull * 1024ull;
+        options.pending_write_bytes = params_base.cache_write_buffer_mib > 0
+            ? (uint64_t) params_base.cache_write_buffer_mib * 1024ull * 1024ull
+            : 0;
+        options.max_artifact_bytes = 0; // derive from the configured disk limit
+        options.pending_write_items = 256;
+
+        std::string error;
+        prefix_cache = server_prefix_cache::PrefixCacheStore::open(options, &error);
+        if (!prefix_cache) {
+            SRV_ERR("failed to initialize persistent prefix cache at '%s': %s\n",
+                    params_base.cache_disk_path.c_str(), error.c_str());
+            return false;
+        }
+        prefix_cache_admission = std::make_unique<server_prefix_cache::PrefixAdmission>(
+            (size_t) params_base.cache_admission_items);
+
+        SRV_INF("persistent prefix cache enabled at '%s' (signature=%s, block=%d)\n",
+                params_base.cache_disk_path.c_str(), prefix_cache_signature.hex().c_str(), params_base.cache_block_size);
+        return true;
+    }
+
     void destroy() {
+        if (prefix_cache) {
+            prefix_cache->shutdown(std::chrono::milliseconds(5000));
+            prefix_cache.reset();
+        }
+        prefix_cache_admission.reset();
+
         spec.reset();
         spec_init.reset();
 
@@ -1050,6 +2459,37 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        if (!params.cache_disk_path.empty() && params.cache_disk_size_mib <= 0) {
+            SRV_ERR("%s", "--cache-disk-size must be greater than zero when --cache-disk is enabled\n");
+            return false;
+        }
+        if (!params.cache_disk_path.empty() && params.cache_ram_mib < 0) {
+            SRV_ERR("%s", "--cache-ram must be finite (>= 0) when --cache-disk is enabled\n");
+            return false;
+        }
+        if (params.cache_block_size < 256 || (params.cache_block_size & (params.cache_block_size - 1)) != 0) {
+            SRV_ERR("%s", "--cache-block-size must be a power of two >= 256\n");
+            return false;
+        }
+        if (params.cache_write_buffer_mib < 0) {
+            SRV_ERR("%s", "--cache-write-buffer must be non-negative\n");
+            return false;
+        }
+        if (params.cache_recurrent_stride < 1) {
+            SRV_ERR("%s", "--cache-recurrent-stride must be at least one\n");
+            return false;
+        }
+        if (params.cache_admission_items < 0) {
+            SRV_ERR("%s", "--cache-admission-items must be non-negative\n");
+            return false;
+        }
+        if (!params.cache_disk_path.empty() &&
+            params.cache_capture_mode == common_params::CACHE_CAPTURE_MODE_REPEAT &&
+            params.cache_admission_items == 0) {
+            SRV_ERR("%s", "--cache-admission-items must be greater than zero in repeat capture mode\n");
+            return false;
+        }
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1398,7 +2838,17 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        if (!params_base.cache_disk_path.empty()) {
+            // The bounded persistent store owns the serialized hot tier when
+            // enabled.  Keep the legacy whole-prompt RAM cache disabled to
+            // avoid accounting the same state twice.
+            if (!init_prefix_cache()) {
+                return false;
+            }
+            prompt_cache.reset();
+            params_base.cache_idle_slots = false;
+            SRV_TRC("%s", "persistent prefix cache is enabled; legacy whole-prompt cache is disabled\n");
+        } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
@@ -1752,6 +3202,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
+                    slot.prefix_cache_last_captured_boundary = 0;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2128,6 +3579,11 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        const bool wait_for_prefix_cache = slot.task->params.cache_precache;
+        if (wait_for_prefix_cache) {
+            prefix_cache_materialize_deferred(slot);
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2157,6 +3613,13 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
         res->n_tokens_cached       = slot.prompt.n_tokens();
+        res->persistent_cache.requested        = slot.prefix_cache_state.requested;
+        res->persistent_cache.eligible         = slot.prefix_cache_state.eligible;
+        res->persistent_cache.staged_blocks    = slot.prefix_cache_state.staged_blocks;
+        res->persistent_cache.published_blocks = slot.prefix_cache_state.published_blocks;
+        res->persistent_cache.recurrent_sidecars = slot.prefix_cache_state.recurrent_sidecars;
+        res->persistent_cache.durable          = slot.prefix_cache_state.durable;
+        res->persistent_cache.reason           = slot.prefix_cache_state.reason;
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
@@ -2188,6 +3651,10 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));
+
+        if (!wait_for_prefix_cache) {
+            prefix_cache_materialize_deferred(slot);
+        }
     }
 
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
@@ -2959,6 +4426,7 @@ private:
 
                     slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
+                    slot.prefix_cache_last_captured_boundary = 0;
                 }
 
                 slot.truncated = true;
@@ -3134,6 +4602,11 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
+                        slot.prefix_cache_state = {};
+                        slot.prefix_cache_state.requested = slot.task->params.cache_persist;
+                        slot.prefix_cache_observed.clear();
+                        slot.prefix_cache_admitted.clear();
+                        slot.prefix_cache_request_captured_boundary = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -3207,6 +4680,8 @@ private:
                                 return;
                             }
 
+                            prefix_cache_prepare_admission(slot, input_tokens);
+
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
@@ -3279,6 +4754,13 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            const int n_past_capture = prefix_cache_adjust_reuse_for_admitted_capture(slot, n_past);
+                            if (n_past_capture < n_past) {
+                                SLT_DBG(slot, "reduced prompt cache reuse for persistent prefix capture: n_past = %d -> %d\n",
+                                        n_past, n_past_capture);
+                                n_past = n_past_capture;
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -3389,6 +4871,20 @@ private:
                                         ++it;
                                     }
                                 }
+                            }
+                        }
+
+                        // Persistent prefix restore is attempted only when the
+                        // resident slot did not already provide a longer
+                        // in-memory prefix.  The restore transaction clears
+                        // the destination sequence before adding artifacts.
+                        if (n_past == 0 && prefix_cache) {
+                            const int32_t restored = prefix_cache_restore(slot, input_tokens);
+                            if (restored > 0) {
+                                n_past = restored;
+                                prefix_cache_metrics.tokens_evaluated_after_restore +=
+                                    slot.task->n_tokens() - restored;
+                                SLT_INF(slot, "restored persistent prefix: %d tokens\n", restored);
                             }
                         }
 
@@ -3525,6 +5021,15 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+
+                        // Persistent captures require the recurrent state to
+                        // be observed exactly at the block boundary.  Stop
+                        // filling this batch as soon as one is reached; the
+                        // next update will continue with the following block.
+                        if (prefix_cache && prefix_cache_request_eligible(slot, input_tokens) &&
+                            slot.prompt.n_tokens() % (size_t) params_base.cache_block_size == 0) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3700,6 +5205,16 @@ private:
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
             return false; // retry with the updated n_batch
+        }
+
+        // Prompt vectors are advanced while the batch is assembled.  The
+        // capture helper independently checks the post-decode memory boundary
+        // before serializing, so a partial sub-batch cannot publish an early
+        // artifact.
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                prefix_cache_stage_capture(slot);
+            }
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -4095,6 +5610,18 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     });
 }
 
+void server_context::prefix_cache_mark_explicit_precache_request() {
+    impl->prefix_cache_metrics.explicit_precache_requests++;
+}
+
+void server_context::prefix_cache_mark_explicit_precache_success() {
+    impl->prefix_cache_metrics.explicit_precache_successes++;
+}
+
+void server_context::prefix_cache_mark_explicit_precache_failure() {
+    impl->prefix_cache_metrics.explicit_precache_failures++;
+}
+
 //
 // server_routes
 //
@@ -4104,7 +5631,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            bool cache_precache) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -4161,6 +5689,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            task.params.cache_precache = cache_precache;
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
@@ -4372,6 +5901,7 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
+          ctx_server_mut(ctx_server),
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
@@ -4633,6 +6163,7 @@ void server_routes::init_routes() {
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
             { "ui",                          params.ui },
+            { "prefix_cache",                this->ctx_server.prefix_cache_json() },
             { "ui_settings",                 meta->json_ui_settings },
             { "chat_template",               tmpl_default },
             { "chat_template_caps",          meta->chat_template_caps },
@@ -4651,13 +6182,42 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_props = [this](const server_http_req &) {
+    this->post_props = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        // update any props here
+
+        // Persistent prefix-cache controls are intentionally model-scoped and
+        // serialized on the server loop.  The endpoint remains opt-in behind
+        // --props, matching the existing global-property contract.
+        if (!req.body.empty()) {
+            const auto data = json::parse(req.body);
+            const auto action = json_value(data, "action", std::string());
+            if (action == "prefix_cache.clear_hot") {
+                if (!ctx_server.prefix_cache_clear_hot()) {
+                    res->error(format_error_response("persistent prefix cache is disabled", ERROR_TYPE_NOT_SUPPORTED));
+                    return res;
+                }
+                res->ok({{ "success", true }, { "action", action }});
+                return res;
+            }
+            if (action == "prefix_cache.clear_disk") {
+                std::string error;
+                if (!ctx_server.prefix_cache_clear_disk(&error)) {
+                    res->error(format_error_response(error.empty() ? "persistent prefix cache is disabled" : error,
+                                                     ERROR_TYPE_NOT_SUPPORTED));
+                    return res;
+                }
+                res->ok({{ "success", true }, { "action", action }});
+                return res;
+            }
+            if (!action.empty()) {
+                res->error(format_error_response("unknown property action", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
 
         res->ok({{ "success", true }});
         return res;
@@ -4842,6 +6402,119 @@ void server_routes::init_routes() {
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
         return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_RESP);
+    };
+
+    this->post_cache_prefix = [this](const server_http_req & req) {
+        ctx_server_mut.prefix_cache_mark_explicit_precache_request();
+
+        auto mark_failure = [&]() {
+            ctx_server_mut.prefix_cache_mark_explicit_precache_failure();
+        };
+        auto mark_success = [&]() {
+            ctx_server_mut.prefix_cache_mark_explicit_precache_success();
+        };
+
+        if (!ctx_server.prefix_cache_enabled()) {
+            auto res = create_response();
+            res->error(format_error_response("persistent prefix cache is disabled", ERROR_TYPE_NOT_SUPPORTED));
+            mark_failure();
+            return res;
+        }
+
+        std::vector<raw_buffer> files;
+        json body;
+        json data;
+        try {
+            body = json::parse(req.body);
+            data = body.contains("messages")
+                ? oaicompat_chat_params_parse(body, meta->chat_params, files)
+                : body;
+        } catch (const std::exception & e) {
+            auto res = create_response();
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            mark_failure();
+            return res;
+        }
+
+        data["cache_persist"] = true;
+        data["cache_prompt"] = true;
+        data["stream"] = false;
+        data["n_predict"] = 1;
+        data["n_cmpl"] = 1;
+
+        const json before_props = ctx_server.prefix_cache_json();
+        const uint64_t before_bytes = json_value(json_value(before_props, "store", json::object()), "bytes_written", (uint64_t) 0);
+
+        auto res = handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            body.contains("messages") ? TASK_RESPONSE_TYPE_OAI_CHAT : TASK_RESPONSE_TYPE_NONE,
+            true);
+
+        if (res->status != 200 || res->data.empty()) {
+            mark_failure();
+            return res;
+        }
+
+        json completion;
+        try {
+            completion = json::parse(res->data);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+            mark_failure();
+            return res;
+        }
+        const json persistent = json_value(completion, "persistent_cache", json::object());
+        const bool eligible = json_value(persistent, "eligible", false);
+        const int32_t published_blocks = json_value(persistent, "published_blocks", 0);
+        const int32_t recurrent_sidecars = json_value(persistent, "recurrent_sidecars", 0);
+        std::string reason = json_value(persistent, "reason", std::string());
+
+        bool durable = false;
+        if (published_blocks > 0) {
+            durable = ctx_server.prefix_cache_flush(std::chrono::seconds(30));
+            if (!durable && reason.empty()) {
+                reason = "writer_flush";
+            }
+        } else if (eligible && reason.empty()) {
+            reason = "no_complete_block";
+        }
+
+        if (!eligible) {
+            res->error(format_error_response(reason.empty() ? "ineligible" : reason, ERROR_TYPE_INVALID_REQUEST));
+            mark_failure();
+            return res;
+        }
+        if (reason.find("backpressure") != std::string::npos) {
+            res->error(format_error_response(reason, ERROR_TYPE_UNAVAILABLE));
+            res->status = 429;
+            mark_failure();
+            return res;
+        }
+        if (!durable) {
+            res->error(format_error_response(reason.empty() ? "prefix cache publication failed" : reason, ERROR_TYPE_SERVER));
+            mark_failure();
+            return res;
+        }
+
+        const int32_t tokens_evaluated = json_value(completion, "tokens_evaluated", 0);
+        const int32_t boundary = published_blocks * params.cache_block_size;
+        const json after_props = ctx_server.prefix_cache_json();
+        const uint64_t after_bytes = json_value(json_value(after_props, "store", json::object()), "bytes_written", (uint64_t) 0);
+        res->ok({
+            { "model", meta->model_name },
+            { "tokens_evaluated", tokens_evaluated },
+            { "boundary", boundary },
+            { "attention_blocks", published_blocks },
+            { "recurrent_sidecars", recurrent_sidecars },
+            { "bytes_published", after_bytes >= before_bytes ? after_bytes - before_bytes : 0 },
+            { "durable", durable },
+            { "reason", reason },
+        });
+        mark_success();
+        return res;
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {

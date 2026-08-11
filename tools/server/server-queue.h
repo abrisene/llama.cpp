@@ -4,6 +4,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
@@ -11,6 +12,19 @@
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
+public:
+    struct coalesce_stats {
+        bool enabled = false;
+        int64_t max_wait_us = 0;
+        int64_t current_wait_us = 0;
+        uint64_t target_tasks = 0;
+        uint64_t wait_cycles = 0;
+        uint64_t wakeups = 0;
+        uint64_t timeouts = 0;
+        uint64_t wait_us = 0;
+        uint64_t admitted_tasks = 0;
+    };
+
 private:
     int id = 0;
     bool running  = false;
@@ -29,6 +43,16 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<bool(void)>           callback_has_batch_capacity;
+
+    int64_t coalesce_max_wait_us = 0;
+    std::atomic<int64_t> coalesce_current_wait_us{0};
+    size_t coalesce_target_tasks = 0;
+    std::atomic<uint64_t> coalesce_wait_cycles{0};
+    std::atomic<uint64_t> coalesce_wakeups{0};
+    std::atomic<uint64_t> coalesce_timeouts{0};
+    std::atomic<uint64_t> coalesce_wait_us{0};
+    std::atomic<uint64_t> coalesce_admitted_tasks{0};
 
 public:
     // Add a new task to the end of the queue
@@ -81,6 +105,9 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    void set_admission_coalesce(int64_t max_wait_us, size_t target_tasks);
+    coalesce_stats get_coalesce_stats() const;
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
@@ -93,6 +120,10 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    void on_has_batch_capacity(std::function<bool(void)> callback) {
+        callback_has_batch_capacity = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

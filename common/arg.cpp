@@ -2582,6 +2582,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--batch-coalesce-us"}, "N",
+        string_format("maximum admission coalescing window for burst requests in microseconds (default: %d, 0 = disabled)",
+            params.batch_coalesce_us),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 2000) {
+                throw std::invalid_argument("batch coalescing window must be between 0 and 2000 microseconds");
+            }
+            params.batch_coalesce_us = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BATCH_COALESCE_US"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",

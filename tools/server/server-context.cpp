@@ -1606,6 +1606,31 @@ private:
 
     server_decode_arbiter decode_arbiter;
 
+    struct microbatch_metrics {
+        std::atomic<uint64_t> decode_calls{0};
+        std::atomic<uint64_t> decode_tokens{0};
+        std::atomic<uint64_t> decode_tokens_max{0};
+        std::atomic<uint64_t> generation_slots{0};
+        std::atomic<uint64_t> generation_slots_max{0};
+        std::atomic<uint64_t> decode_us{0};
+
+        static void update_max(std::atomic<uint64_t> & target, uint64_t value) {
+            uint64_t current = target.load(std::memory_order_relaxed);
+            while (current < value &&
+                    !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+            }
+        }
+
+        void on_decode(uint64_t tokens, uint64_t slots, uint64_t elapsed_us) {
+            decode_calls.fetch_add(1, std::memory_order_relaxed);
+            decode_tokens.fetch_add(tokens, std::memory_order_relaxed);
+            generation_slots.fetch_add(slots, std::memory_order_relaxed);
+            decode_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+            update_max(decode_tokens_max, tokens);
+            update_max(generation_slots_max, slots);
+        }
+    } microbatch_metrics;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -2926,6 +2951,20 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        queue_tasks.on_has_batch_capacity([this]() {
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        int64_t coalesce_us = params_base.batch_coalesce_us;
+        if (decode_arbiter.stats().enabled && coalesce_us > 0) {
+            SRV_WRN("%s", "batch coalescing disabled because the cross-model decode arbiter already owns the latency budget\n");
+            coalesce_us = 0;
+        }
+        queue_tasks.set_admission_coalesce(coalesce_us, (size_t) params_base.n_parallel);
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -4345,6 +4384,13 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int64_t decode_step_started_us = ggml_time_us();
+            uint64_t generation_slots = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.is_processing()) {
+                    generation_slots++;
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -4374,6 +4420,12 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
+                if (generation_slots > 0) {
+                    microbatch_metrics.on_decode(
+                            (uint64_t) batch_view.n_tokens,
+                            generation_slots,
+                            (uint64_t) (ggml_time_us() - decode_step_started_us));
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -5256,7 +5308,6 @@ private:
             // otherwise the arbiter would only serialize command submission.
             llama_synchronize(ctx_tgt);
         }
-
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -5662,6 +5713,31 @@ json server_context::decode_arbiter_json() const {
         {"concurrent_demand", stats.contentions},
         {"wait_us",      stats.wait_us},
         {"hold_us",      stats.hold_us},
+    };
+}
+
+json server_context::microbatch_json() const {
+    const auto queue = impl->queue_tasks.get_coalesce_stats();
+    const uint64_t calls = impl->microbatch_metrics.decode_calls.load(std::memory_order_relaxed);
+    const uint64_t tokens = impl->microbatch_metrics.decode_tokens.load(std::memory_order_relaxed);
+    const uint64_t slots = impl->microbatch_metrics.generation_slots.load(std::memory_order_relaxed);
+    return {
+        {"enabled",              queue.enabled},
+        {"max_wait_us",          queue.max_wait_us},
+        {"current_wait_us",      queue.current_wait_us},
+        {"target_tasks",         queue.target_tasks},
+        {"wait_cycles",          queue.wait_cycles},
+        {"wakeups",              queue.wakeups},
+        {"timeouts",             queue.timeouts},
+        {"wait_us",              queue.wait_us},
+        {"admitted_tasks",       queue.admitted_tasks},
+        {"decode_calls",         calls},
+        {"decode_tokens",        tokens},
+        {"decode_tokens_max",    impl->microbatch_metrics.decode_tokens_max.load(std::memory_order_relaxed)},
+        {"tokens_per_decode",    calls > 0 ? (double) tokens / calls : 0.0},
+        {"generation_slots_max", impl->microbatch_metrics.generation_slots_max.load(std::memory_order_relaxed)},
+        {"slots_per_decode",     calls > 0 ? (double) slots / calls : 0.0},
+        {"decode_us",            impl->microbatch_metrics.decode_us.load(std::memory_order_relaxed)},
     };
 }
 
@@ -6208,6 +6284,7 @@ void server_routes::init_routes() {
             { "ui",                          params.ui },
             { "prefix_cache",                this->ctx_server.prefix_cache_json() },
             { "decode_arbiter",              this->ctx_server_mut.decode_arbiter_json() },
+            { "microbatch",                  this->ctx_server_mut.microbatch_json() },
             { "ui_settings",                 meta->json_ui_settings },
             { "chat_template",               tmpl_default },
             { "chat_template_caps",          meta->chat_template_caps },

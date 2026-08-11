@@ -253,6 +253,13 @@ target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR
 llama_build_and_test(test-server-decode-arbiter.cpp ../tools/server/server-decode-arbiter.cpp)
 target_include_directories(test-server-decode-arbiter PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+llama_build_and_test(test-server-queue-coalesce.cpp)
+target_include_directories(test-server-queue-coalesce PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server
+    ${PROJECT_SOURCE_DIR}/tools/mtmd
+)
+target_link_libraries(test-server-queue-coalesce PRIVATE server-context)
+
 llama_build_and_test(test-server-prefix-admission.cpp ../tools/server/server-prefix-admission.cpp ../tools/server/server-prefix-cache.cpp)
 target_include_directories(test-server-prefix-admission PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 

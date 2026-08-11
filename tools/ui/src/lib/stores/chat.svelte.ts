@@ -34,6 +34,7 @@ import { DatabaseService } from '$lib/services/database.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { agenticStore } from '$lib/stores/agentic.svelte';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
+import { mcpResourceStore } from '$lib/stores/mcp-resources.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
 import { modelsStore } from '$lib/stores/models.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
@@ -41,6 +42,7 @@ import { settingsStore } from '$lib/stores/settings.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import type {
 	ApiChatMessageData,
+	ApiPrefixCacheResponse,
 	ApiProcessingState,
 	ApiStreamSession,
 	ChatMessagePromptProgress,
@@ -1319,6 +1321,52 @@ class ChatStore {
 				type: dialogType
 			});
 		}
+	}
+
+	async precachePrefix(
+		content = '',
+		extras?: DatabaseMessageExtra[]
+	): Promise<ApiPrefixCacheResponse> {
+		const activeConv = conversationsStore.activeConversation;
+
+		if (activeConv && this.isChatLoadingInternal(activeConv.id)) {
+			throw new Error('Generation is active');
+		}
+
+		this.cancelPreEncode();
+
+		const messages = conversationsStore.activeMessages.slice() as DatabaseMessage[];
+		const resourceExtras = mcpResourceStore.toMessageExtras();
+		const draftExtras =
+			resourceExtras.length > 0 ? [...(extras || []), ...resourceExtras] : extras;
+		const draftContent = content.trim();
+
+		if (draftContent || (draftExtras && draftExtras.length > 0)) {
+			messages.push({
+				children: [],
+				content: draftContent,
+				convId: activeConv?.id ?? 'precache-prefix-draft',
+				extra: draftExtras,
+				id: 'precache-prefix-draft',
+				parent: messages[messages.length - 1]?.id ?? null,
+				role: MessageRole.USER,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+		}
+
+		let effectiveModel: string | null | undefined = undefined;
+
+		if (serverStore.isRouterMode) {
+			effectiveModel = modelsStore.selectedModelName || this.getConversationModel(messages);
+		}
+
+		return ChatService.precachePrefix(messages, {
+			...this.getApiOptions(),
+			...(effectiveModel ? { model: effectiveModel } : {}),
+			stream: false
+		});
 	}
 
 	private async streamChatCompletion(

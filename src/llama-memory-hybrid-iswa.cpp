@@ -202,6 +202,68 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
     mem_recr->state_read(io, seq_id, flags);
 }
 
+uint32_t llama_memory_hybrid_iswa::state_seq_components() const {
+    // Presence is independent from range-cache eligibility.  iSWA owns both
+    // attention and recurrent memory, even though its attention layout is not
+    // yet safe for the version-1 range contract.
+    uint32_t components = 0;
+    if (mem_attn) {
+        components |= LLAMA_STATE_SEQ_COMPONENT_ATTENTION;
+    }
+    if (mem_recr) {
+        components |= LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
+    }
+    return components;
+}
+
+uint32_t llama_memory_hybrid_iswa::state_seq_capabilities() const {
+    // Advertise presence bits only.  Range save/restore remains unsupported
+    // until both iSWA children have dedicated layout/transaction tests.
+    const uint32_t components = state_seq_components();
+    uint32_t capabilities = 0;
+    if (components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) {
+        capabilities |= LLAMA_STATE_SEQ_CAPABILITY_ATTENTION;
+    }
+    if (components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) {
+        capabilities |= LLAMA_STATE_SEQ_CAPABILITY_RECURRENT;
+    }
+    return capabilities;
+}
+
+size_t llama_memory_hybrid_iswa::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id       seq_id,
+        uint32_t           components,
+        llama_pos          p0,
+        llama_pos          p1,
+        llama_state_seq_flags flags) const {
+    (void) io;
+    (void) seq_id;
+    (void) components;
+    (void) p0;
+    (void) p1;
+    (void) flags;
+    LLAMA_LOG_ERROR("%s: range state serialization is unsupported for iSWA memory\n", __func__);
+    return 0;
+}
+
+size_t llama_memory_hybrid_iswa::state_read_range(
+        llama_io_read_i & io,
+        llama_seq_id      dest_seq_id,
+        uint32_t          components,
+        llama_pos          p0,
+        llama_pos          p1,
+        llama_state_seq_flags flags) {
+    (void) io;
+    (void) dest_seq_id;
+    (void) components;
+    (void) p0;
+    (void) p1;
+    (void) flags;
+    LLAMA_LOG_ERROR("%s: range state restore is unsupported for iSWA memory\n", __func__);
+    return 0;
+}
+
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
 }

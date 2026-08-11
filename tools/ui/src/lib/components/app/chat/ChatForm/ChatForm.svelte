@@ -83,6 +83,10 @@
 		// Event Handlers
 		onAttachmentRemove?: (index: number) => void;
 		onFilesAdd?: (files: File[]) => void;
+		onPrecachePrefix?: (draft: {
+			message: string;
+			files: ChatUploadedFile[];
+		}) => Promise<void>;
 		onStop?: () => void;
 		onSubmit?: () => void;
 		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
@@ -98,6 +102,7 @@
 		isLoading = false,
 		onAttachmentRemove,
 		onFilesAdd,
+		onPrecachePrefix,
 		onStop,
 		onSubmit,
 		onSystemPromptClick,
@@ -543,6 +548,17 @@
 			}
 		}
 	}
+
+	async function handlePrecachePrefix() {
+		if (disabled || hasLoadingAttachments) return;
+
+		if (!checkModelSelected()) return;
+
+		await onPrecachePrefix?.({
+			files: [...uploadedFiles],
+			message: value.trim()
+		});
+	}
 </script>
 
 <ChatFormFileInputInvisible bind:this={fileInputRef} onFileSelect={handleFileSelect} />
@@ -655,8 +671,10 @@
 				{showAddButton}
 				{showModelSelector}
 				{uploadedFiles}
+				{activeModelId}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
+				onPrecachePrefix={handlePrecachePrefix}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
 				onMcpPromptClick={showMcpPromptButton ? () => pickers.openPromptPicker() : undefined}

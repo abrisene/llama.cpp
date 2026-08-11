@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { File, FolderOpen, MessageSquare, Zap } from '@lucide/svelte';
+	import { Database, File, FolderOpen, LoaderCircle, MessageSquare, TriangleAlert, Zap } from '@lucide/svelte';
 	import {
 		Check,
 		ChevronDown,
@@ -24,7 +24,7 @@
 	import { useToolsPanel } from '$lib/hooks/use-tools-panel.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import type { Snippet } from 'svelte';
+	import { onDestroy, type Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -38,6 +38,9 @@
 		onSystemPromptClick?: () => void;
 		onMcpPromptClick?: () => void;
 		onMcpResourcesClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
+		precachePrefixDisabled?: boolean;
+		showPrecachePrefix?: boolean;
 		trigger: Snippet<[{ disabled: boolean; onclick?: () => void }]>;
 	}
 
@@ -52,7 +55,10 @@
 		onFileUpload,
 		onMcpPromptClick,
 		onMcpResourcesClick,
+		onPrecachePrefix,
 		onSystemPromptClick,
+		precachePrefixDisabled = false,
+		showPrecachePrefix = false,
 		trigger
 	}: Props = $props();
 
@@ -61,6 +67,8 @@
 	let filesExpanded = $state(true);
 	let toolsExpanded = $state(false);
 	let mcpExpanded = $state(false);
+	let precacheState = $state<'idle' | 'working' | 'complete' | 'failed'>('idle');
+	let precacheResetTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const attachmentMenu = useAttachmentMenu(
 		() => ({
@@ -86,6 +94,35 @@
 		'flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-accent';
 
 	let mcpServers = $derived(mcpStore.getServers());
+
+	function queuePrecacheStateReset() {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheResetTimer = setTimeout(() => {
+			precacheState = 'idle';
+		}, 2400);
+	}
+
+	async function handlePrecachePrefixClick() {
+		if (!onPrecachePrefix || precachePrefixDisabled || precacheState === 'working') return;
+
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheState = 'working';
+
+		try {
+			await onPrecachePrefix();
+			precacheState = 'complete';
+		} catch {
+			precacheState = 'failed';
+		} finally {
+			queuePrecacheStateReset();
+		}
+	}
+
+	onDestroy(() => {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+	});
 </script>
 
 <div class="flex items-center gap-1 {className}">
@@ -348,6 +385,29 @@
 
 					<span>System Message</span>
 				</button>
+
+				{#if showPrecachePrefix && onPrecachePrefix}
+					<button
+						type="button"
+						class={sheetItemClass}
+						disabled={precachePrefixDisabled || precacheState === 'working'}
+						onclick={handlePrecachePrefixClick}
+					>
+						{#if precacheState === 'working'}
+							<LoaderCircle class="{ICON_CLASS_DEFAULT} shrink-0 animate-spin" />
+							<span>Caching prefix</span>
+						{:else if precacheState === 'complete'}
+							<Check class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Prefix cached</span>
+						{:else if precacheState === 'failed'}
+							<TriangleAlert class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache failed</span>
+						{:else}
+							<Database class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache prefix</span>
+						{/if}
+					</button>
+				{/if}
 
 				{#if hasMcpPromptsSupport}
 					<button

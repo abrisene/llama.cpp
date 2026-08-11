@@ -36,6 +36,7 @@ import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
 	ApiChatMessageData,
+	ApiPrefixCacheResponse,
 	ApiStreamSession
 } from '$lib/types/api';
 import { isAbortError } from '$lib/utils/abort';
@@ -74,6 +75,216 @@ function streamStorageKey(conversationId: string): string {
 }
 
 export class ChatService {
+	static async buildChatCompletionRequest(
+		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		options: SettingsChatServiceOptions = {}
+	): Promise<ApiChatCompletionRequest> {
+		const {
+			backend_sampling,
+			continueFinalMessage,
+			custom,
+			disableReasoningParsing,
+			dry_allowed_length,
+			dry_base,
+			dry_multiplier,
+			dry_penalty_last_n,
+			dynatemp_exponent,
+			dynatemp_range,
+			enableThinking,
+			excludeReasoningFromContext,
+			frequency_penalty,
+			max_tokens,
+			min_p,
+			presence_penalty,
+			reasoningEffort,
+			repeat_last_n,
+			repeat_penalty,
+			samplers,
+			stream,
+			systemMessage,
+			temperature,
+			timings_per_token,
+			tools,
+			top_k,
+			top_p,
+			typ_p,
+			xtc_probability,
+			xtc_threshold
+		} = options;
+		const normalizedMessages: ApiChatMessageData[] = (
+			await Promise.all(
+				messages.map((msg) => {
+					if ('id' in msg && 'convId' in msg && 'timestamp' in msg) {
+						const dbMsg = msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] };
+
+						return ChatService.convertDbMessageToApiChatMessageData(dbMsg);
+					}
+
+					return msg as ApiChatMessageData;
+				})
+			)
+		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
+			if (msg.role === MessageRole.SYSTEM) {
+				const content = typeof msg.content === 'string' ? msg.content : '';
+
+				return content.trim().length > 0;
+			}
+
+			return true;
+		});
+
+		const configuredSystemMessage = systemMessage?.toString().trim();
+
+		if (
+			configuredSystemMessage &&
+			!normalizedMessages.some((msg) => msg.role === MessageRole.SYSTEM)
+		) {
+			normalizedMessages.unshift({
+				content: configuredSystemMessage,
+				role: MessageRole.SYSTEM
+			});
+		}
+
+		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+			normalizedMessages.forEach((msg) => {
+				if (Array.isArray(msg.content)) {
+					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
+						if (part.type === ContentPartType.IMAGE_URL) {
+							console.info(
+								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
+							);
+
+							return false;
+						}
+
+						return true;
+					});
+
+					if (
+						msg.content.length === 1 &&
+						msg.content[0].type === ContentPartType.TEXT &&
+						typeof msg.content[0].text === 'string'
+					) {
+						msg.content = msg.content[0].text;
+					}
+				}
+			});
+		}
+
+		const requestBody: ApiChatCompletionRequest = {
+			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
+				const mapped: ApiChatCompletionRequest['messages'][0] = {
+					content: excludeReasoningFromContext
+						? ChatService.stripReasoningContent(msg.content)
+						: msg.content,
+					role: msg.role,
+					tool_call_id: msg.tool_call_id,
+					tool_calls: msg.tool_calls
+				};
+
+				if (!excludeReasoningFromContext && msg.reasoning_content) {
+					mapped.reasoning_content = msg.reasoning_content;
+				}
+
+				return mapped;
+			}),
+			return_progress: stream ? true : undefined,
+			sse_ping_interval: stream ? 1 : undefined,
+			stream,
+			tools: tools && tools.length > 0 ? tools : undefined
+		};
+
+		if (options.model) {
+			requestBody.model = options.model;
+		}
+
+		requestBody.reasoning_format = disableReasoningParsing
+			? ReasoningFormat.NONE
+			: ReasoningFormat.AUTO;
+
+		const reasoningBudgetTokens =
+			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
+
+		if (enableThinking !== undefined) {
+			requestBody.chat_template_kwargs = {
+				...(requestBody.chat_template_kwargs ?? {}),
+				enable_thinking: enableThinking
+			};
+		}
+
+		if (reasoningBudgetTokens >= 0) {
+			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
+		}
+
+		requestBody.reasoning_control = true;
+
+		if (continueFinalMessage) {
+			requestBody.continue_final_message = true;
+			requestBody.add_generation_prompt = false;
+		}
+
+		if (temperature !== undefined) requestBody.temperature = temperature;
+
+		if (max_tokens !== undefined) {
+			requestBody.max_tokens = max_tokens !== null && max_tokens !== 0 ? max_tokens : -1;
+		}
+
+		if (dynatemp_range !== undefined) requestBody.dynatemp_range = dynatemp_range;
+
+		if (dynatemp_exponent !== undefined) requestBody.dynatemp_exponent = dynatemp_exponent;
+
+		if (top_k !== undefined) requestBody.top_k = top_k;
+
+		if (top_p !== undefined) requestBody.top_p = top_p;
+
+		if (min_p !== undefined) requestBody.min_p = min_p;
+
+		if (xtc_probability !== undefined) requestBody.xtc_probability = xtc_probability;
+
+		if (xtc_threshold !== undefined) requestBody.xtc_threshold = xtc_threshold;
+
+		if (typ_p !== undefined) requestBody.typ_p = typ_p;
+
+		if (repeat_last_n !== undefined) requestBody.repeat_last_n = repeat_last_n;
+
+		if (repeat_penalty !== undefined) requestBody.repeat_penalty = repeat_penalty;
+
+		if (presence_penalty !== undefined) requestBody.presence_penalty = presence_penalty;
+
+		if (frequency_penalty !== undefined) requestBody.frequency_penalty = frequency_penalty;
+
+		if (dry_multiplier !== undefined) requestBody.dry_multiplier = dry_multiplier;
+
+		if (dry_base !== undefined) requestBody.dry_base = dry_base;
+
+		if (dry_allowed_length !== undefined) requestBody.dry_allowed_length = dry_allowed_length;
+
+		if (dry_penalty_last_n !== undefined) requestBody.dry_penalty_last_n = dry_penalty_last_n;
+
+		if (samplers !== undefined) {
+			requestBody.samplers =
+				typeof samplers === 'string'
+					? samplers.split(';').filter((s: string) => s.trim())
+					: samplers;
+		}
+
+		if (backend_sampling !== undefined) requestBody.backend_sampling = backend_sampling;
+
+		if (timings_per_token !== undefined) requestBody.timings_per_token = timings_per_token;
+
+		if (custom) {
+			try {
+				const customParams = typeof custom === 'string' ? JSON.parse(custom) : custom;
+
+				Object.assign(requestBody, customParams);
+			} catch (error) {
+				console.warn('Failed to parse custom parameters:', error);
+			}
+		}
+
+		return requestBody;
+	}
+
 	/**
 	 *
 	 *
@@ -145,23 +356,6 @@ export class ChatService {
 		signal?: AbortSignal
 	): Promise<string | void> {
 		const {
-			backend_sampling,
-			continueFinalMessage,
-			custom,
-			// Config options
-			disableReasoningParsing,
-			dry_allowed_length,
-			dry_base,
-			dry_multiplier,
-			dry_penalty_last_n,
-			dynatemp_exponent,
-			// Sampling parameters
-			dynatemp_range,
-			enableThinking,
-			excludeReasoningFromContext,
-			frequency_penalty,
-			max_tokens,
-			min_p,
 			onChunk,
 			onComplete,
 			onCompletionId,
@@ -171,190 +365,9 @@ export class ChatService {
 			onReasoningChunk,
 			onTimings,
 			onToolCallChunk,
-			presence_penalty,
-			reasoningEffort,
-			// Penalty parameters
-			repeat_last_n,
-			repeat_penalty,
-			// Other parameters
-			samplers,
-			stream,
-			// Generation parameters
-			temperature,
-			timings_per_token,
-			// Tools for function calling
-			tools,
-			top_k,
-			top_p,
-			typ_p,
-			xtc_probability,
-			xtc_threshold
+			stream
 		} = options;
-		const normalizedMessages: ApiChatMessageData[] = (
-			await Promise.all(
-				messages.map((msg) => {
-					if ('id' in msg && 'convId' in msg && 'timestamp' in msg) {
-						const dbMsg = msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] };
-
-						return ChatService.convertDbMessageToApiChatMessageData(dbMsg);
-					} else {
-						return msg as ApiChatMessageData;
-					}
-				})
-			)
-		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
-			// Filter out empty system messages
-			if (msg.role === MessageRole.SYSTEM) {
-				const content = typeof msg.content === 'string' ? msg.content : '';
-
-				return content.trim().length > 0;
-			}
-
-			return true;
-		});
-
-		// Filter out image attachments if the model doesn't support vision
-		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
-			normalizedMessages.forEach((msg) => {
-				if (Array.isArray(msg.content)) {
-					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
-						if (part.type === ContentPartType.IMAGE_URL) {
-							console.info(
-								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
-							);
-
-							return false;
-						}
-
-						return true;
-					});
-
-					// If only text remains and it's a single part, simplify to string
-					if (
-						msg.content.length === 1 &&
-						msg.content[0].type === ContentPartType.TEXT &&
-						typeof msg.content[0].text === 'string'
-					) {
-						msg.content = msg.content[0].text;
-					}
-				}
-			});
-		}
-
-		const requestBody: ApiChatCompletionRequest = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
-				const mapped: ApiChatCompletionRequest['messages'][0] = {
-					content: msg.content,
-					role: msg.role,
-					tool_call_id: msg.tool_call_id,
-					tool_calls: msg.tool_calls
-				};
-
-				// Include reasoning_content from the dedicated field
-				if (!excludeReasoningFromContext && msg.reasoning_content) {
-					mapped.reasoning_content = msg.reasoning_content;
-				}
-
-				return mapped;
-			}),
-			return_progress: stream ? true : undefined,
-			sse_ping_interval: stream ? 1 : undefined,
-			stream,
-			tools: tools && tools.length > 0 ? tools : undefined
-		};
-
-		// Include model in request if provided (required in ROUTER mode)
-		if (options.model) {
-			requestBody.model = options.model;
-		}
-
-		requestBody.reasoning_format = disableReasoningParsing
-			? ReasoningFormat.NONE
-			: ReasoningFormat.AUTO;
-
-		const reasoningBudgetTokens =
-			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
-
-		// an explicit user choice injects the kwarg, otherwise it is omitted so
-		// the server default applies (--reasoning flag or chat template)
-		if (enableThinking !== undefined) {
-			requestBody.chat_template_kwargs = {
-				...(requestBody.chat_template_kwargs ?? {}),
-				enable_thinking: enableThinking
-			};
-		}
-
-		if (reasoningBudgetTokens >= 0) {
-			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
-		}
-
-		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
-		requestBody.reasoning_control = true;
-
-		if (continueFinalMessage) {
-			requestBody.continue_final_message = true;
-			requestBody.add_generation_prompt = false;
-		}
-
-		if (temperature !== undefined) requestBody.temperature = temperature;
-
-		if (max_tokens !== undefined) {
-			// Set max_tokens to -1 (infinite) when explicitly configured as 0 or null
-			requestBody.max_tokens = max_tokens !== null && max_tokens !== 0 ? max_tokens : -1;
-		}
-
-		if (dynatemp_range !== undefined) requestBody.dynatemp_range = dynatemp_range;
-
-		if (dynatemp_exponent !== undefined) requestBody.dynatemp_exponent = dynatemp_exponent;
-
-		if (top_k !== undefined) requestBody.top_k = top_k;
-
-		if (top_p !== undefined) requestBody.top_p = top_p;
-
-		if (min_p !== undefined) requestBody.min_p = min_p;
-
-		if (xtc_probability !== undefined) requestBody.xtc_probability = xtc_probability;
-
-		if (xtc_threshold !== undefined) requestBody.xtc_threshold = xtc_threshold;
-
-		if (typ_p !== undefined) requestBody.typ_p = typ_p;
-
-		if (repeat_last_n !== undefined) requestBody.repeat_last_n = repeat_last_n;
-
-		if (repeat_penalty !== undefined) requestBody.repeat_penalty = repeat_penalty;
-
-		if (presence_penalty !== undefined) requestBody.presence_penalty = presence_penalty;
-
-		if (frequency_penalty !== undefined) requestBody.frequency_penalty = frequency_penalty;
-
-		if (dry_multiplier !== undefined) requestBody.dry_multiplier = dry_multiplier;
-
-		if (dry_base !== undefined) requestBody.dry_base = dry_base;
-
-		if (dry_allowed_length !== undefined) requestBody.dry_allowed_length = dry_allowed_length;
-
-		if (dry_penalty_last_n !== undefined) requestBody.dry_penalty_last_n = dry_penalty_last_n;
-
-		if (samplers !== undefined) {
-			requestBody.samplers =
-				typeof samplers === 'string'
-					? samplers.split(';').filter((s: string) => s.trim())
-					: samplers;
-		}
-
-		if (backend_sampling !== undefined) requestBody.backend_sampling = backend_sampling;
-
-		if (timings_per_token !== undefined) requestBody.timings_per_token = timings_per_token;
-
-		if (custom) {
-			try {
-				const customParams = typeof custom === 'string' ? JSON.parse(custom) : custom;
-
-				Object.assign(requestBody, customParams);
-			} catch (error) {
-				console.warn('Failed to parse custom parameters:', error);
-			}
-		}
+		const requestBody = await ChatService.buildChatCompletionRequest(messages, options);
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };
@@ -758,6 +771,30 @@ export class ChatService {
 				console.warn('[ChatService] Pre-encode request failed:', error);
 			}
 		}
+	}
+
+	static async precachePrefix(
+		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		options: SettingsChatServiceOptions = {},
+		signal?: AbortSignal
+	): Promise<ApiPrefixCacheResponse> {
+		const requestBody = await ChatService.buildChatCompletionRequest(messages, {
+			...options,
+			stream: false
+		});
+
+		const response = await fetch(API_CHAT.PREFIX_CACHE, {
+			body: JSON.stringify(requestBody),
+			headers: getJsonHeaders(),
+			method: 'POST',
+			signal
+		});
+
+		if (!response.ok) {
+			throw await ChatService.parseErrorResponse(response);
+		}
+
+		return (await response.json()) as ApiPrefixCacheResponse;
 	}
 
 	/**

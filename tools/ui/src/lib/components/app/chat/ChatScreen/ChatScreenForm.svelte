@@ -13,6 +13,7 @@
 		isLoading?: boolean;
 		onFileRemove?: (fileId: string) => void;
 		onFileUpload?: (files: File[]) => void;
+		onPrecachePrefix?: (message: string, files?: ChatUploadedFile[]) => Promise<boolean>;
 		onSend?: (message: string, files?: ChatUploadedFile[]) => Promise<boolean>;
 		onStop?: () => void;
 		onSystemPromptAdd?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
@@ -26,6 +27,7 @@
 		isLoading = false,
 		onFileRemove,
 		onFileUpload,
+		onPrecachePrefix,
 		onSend,
 		onStop,
 		onSystemPromptAdd,
@@ -101,6 +103,14 @@
 		}
 	}
 
+	async function handlePrecachePrefix(draft: { message: string; files: ChatUploadedFile[] }) {
+		const success = await onPrecachePrefix?.(draft.message.trim(), [...draft.files]);
+
+		if (success === false) {
+			throw new Error('Failed to precache prefix');
+		}
+	}
+
 	function handleSystemPromptClick() {
 		onSystemPromptAdd?.({ files: uploadedFiles, message });
 	}
@@ -157,6 +167,7 @@
 		{isLoading}
 		showMcpPromptButton
 		onFilesAdd={handleFilesAdd}
+		onPrecachePrefix={handlePrecachePrefix}
 		{onStop}
 		onSubmit={handleSubmit}
 		onSystemPromptClick={handleSystemPromptClick}

@@ -15,7 +15,10 @@
 		onMcpPromptClick?: () => void;
 		onMcpResourcesClick?: () => void;
 		onMcpSettingsClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 		onSystemPromptClick?: () => void;
+		precachePrefixDisabled?: boolean;
+		showPrecachePrefix?: boolean;
 	}
 
 	let {
@@ -29,7 +32,10 @@
 		onMcpPromptClick,
 		onMcpResourcesClick,
 		onMcpSettingsClick,
-		onSystemPromptClick
+		onPrecachePrefix,
+		onSystemPromptClick,
+		precachePrefixDisabled = false,
+		showPrecachePrefix = false
 	}: Props = $props();
 </script>
 
@@ -45,6 +51,9 @@
 		{onSystemPromptClick}
 		{onMcpPromptClick}
 		{onMcpResourcesClick}
+		{onPrecachePrefix}
+		{precachePrefixDisabled}
+		{showPrecachePrefix}
 	>
 		{#snippet trigger({ disabled, onclick })}
 			<ChatFormActionAddButton {disabled} {onclick} />
@@ -62,6 +71,9 @@
 		{onMcpPromptClick}
 		{onMcpResourcesClick}
 		{onMcpSettingsClick}
+		{onPrecachePrefix}
 		{onSystemPromptClick}
+		{precachePrefixDisabled}
+		{showPrecachePrefix}
 	/>
 {/if}

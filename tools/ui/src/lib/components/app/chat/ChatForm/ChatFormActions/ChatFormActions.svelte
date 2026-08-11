@@ -21,6 +21,8 @@
 	} from '$lib/stores/chat.svelte';
 	import { activeMessages, conversationsStore } from '$lib/stores/conversations.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { modelsStore } from '$lib/stores/models.svelte';
+	import { isRouterMode, serverStore } from '$lib/stores/server.svelte';
 	import { config } from '$lib/stores/settings.svelte';
 	import { getFileTypeCategory } from '$lib/utils';
 
@@ -29,6 +31,7 @@
 		canSubmit?: boolean;
 		class?: string;
 		disabled?: boolean;
+		activeModelId?: string | null;
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
@@ -41,6 +44,7 @@
 		onSystemPromptClick?: () => void;
 		onMcpPromptClick?: () => void;
 		onMcpResourcesClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 	}
 
 	let {
@@ -48,6 +52,7 @@
 		canSubmit = false,
 		class: className = '',
 		disabled = false,
+		activeModelId = null,
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
@@ -55,6 +60,7 @@
 		onMcpPromptClick,
 		onMcpResourcesClick,
 		onMicClick,
+		onPrecachePrefix,
 		onStop,
 		onSystemPromptClick,
 		showAddButton = true,
@@ -89,6 +95,20 @@
 	let shouldShowRecordButton = $derived(
 		hasAudioModality && !canSubmit && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
+	let selectedModelProps = $derived.by(() => {
+		if (!isRouterMode()) return serverStore.props;
+
+		if (!activeModelId) return null;
+
+		const cached = modelsStore.getModelProps(activeModelId);
+
+		if (!cached) {
+			void modelsStore.fetchModelProps(activeModelId);
+		}
+
+		return cached;
+	});
+	let showPrecachePrefix = $derived(selectedModelProps?.prefix_cache?.enabled === true);
 
 	let selectorModelRef: ChatFormActionModels | undefined = $state(undefined);
 
@@ -159,7 +179,10 @@
 				{onSystemPromptClick}
 				{onMcpPromptClick}
 				{onMcpResourcesClick}
+				{onPrecachePrefix}
 				onMcpSettingsClick={() => goto(ROUTES.MCP_SERVERS)}
+				precachePrefixDisabled={isLoading || disabled}
+				{showPrecachePrefix}
 			/>
 		</div>
 	{/if}

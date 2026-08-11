@@ -1,5 +1,15 @@
 <script lang="ts">
-	import { File, FolderOpen, MessageSquare, Plus, Zap } from '@lucide/svelte';
+	import {
+		Check,
+		Database,
+		File,
+		FolderOpen,
+		LoaderCircle,
+		MessageSquare,
+		Plus,
+		TriangleAlert,
+		Zap
+	} from '@lucide/svelte';
 	import {
 		ChatFormActionAddMcpServersSubmenu,
 		ChatFormActionAddReasoningSubmenu,
@@ -16,6 +26,7 @@
 	} from '$lib/constants';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
+	import { onDestroy } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -26,10 +37,13 @@
 		hasMcpPromptsSupport?: boolean;
 		hasMcpResourcesSupport?: boolean;
 		onFileUpload?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 		onSystemPromptClick?: () => void;
 		onMcpPromptClick?: () => void;
 		onMcpSettingsClick?: () => void;
 		onMcpResourcesClick?: () => void;
+		precachePrefixDisabled?: boolean;
+		showPrecachePrefix?: boolean;
 	}
 
 	let {
@@ -44,10 +58,15 @@
 		onMcpPromptClick,
 		onMcpResourcesClick,
 		onMcpSettingsClick,
-		onSystemPromptClick
+		onPrecachePrefix,
+		onSystemPromptClick,
+		precachePrefixDisabled = false,
+		showPrecachePrefix = false
 	}: Props = $props();
 
 	let dropdownOpen = $state(false);
+	let precacheState = $state<'idle' | 'working' | 'complete' | 'failed'>('idle');
+	let precacheResetTimer: ReturnType<typeof setTimeout> | undefined;
 	// The system message action moves focus to the message editor, so the menu
 	// must not restore focus to the trigger on close
 	let suppressCloseAutoFocus = false;
@@ -55,6 +74,31 @@
 	function handleMcpSettingsClick() {
 		dropdownOpen = false;
 		onMcpSettingsClick?.();
+	}
+
+	function queuePrecacheStateReset() {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheResetTimer = setTimeout(() => {
+			precacheState = 'idle';
+		}, 2400);
+	}
+
+	async function handlePrecachePrefixClick() {
+		if (!onPrecachePrefix || precachePrefixDisabled || precacheState === 'working') return;
+
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheState = 'working';
+
+		try {
+			await onPrecachePrefix();
+			precacheState = 'complete';
+		} catch {
+			precacheState = 'failed';
+		} finally {
+			queuePrecacheStateReset();
+		}
 	}
 
 	const attachmentMenu = useAttachmentMenu(
@@ -70,6 +114,10 @@
 			dropdownOpen = false;
 		}
 	);
+
+	onDestroy(() => {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+	});
 </script>
 
 <div class="flex items-center gap-1 {className}">
@@ -169,6 +217,31 @@
 
 				<span>System Message</span>
 			</DropdownMenu.Item>
+
+			{#if showPrecachePrefix && onPrecachePrefix}
+				<DropdownMenu.Item
+					class="flex cursor-pointer items-center gap-2"
+					disabled={precachePrefixDisabled || precacheState === 'working'}
+					onclick={(event) => {
+						event.preventDefault();
+						void handlePrecachePrefixClick();
+					}}
+				>
+					{#if precacheState === 'working'}
+						<LoaderCircle class="{ICON_CLASS_DEFAULT} animate-spin" />
+						<span>Caching prefix</span>
+					{:else if precacheState === 'complete'}
+						<Check class={ICON_CLASS_DEFAULT} />
+						<span>Prefix cached</span>
+					{:else if precacheState === 'failed'}
+						<TriangleAlert class={ICON_CLASS_DEFAULT} />
+						<span>Precache failed</span>
+					{:else}
+						<Database class={ICON_CLASS_DEFAULT} />
+						<span>Precache prefix</span>
+					{/if}
+				</DropdownMenu.Item>
+			{/if}
 
 			<ChatFormActionAddToolsSubmenu />
 

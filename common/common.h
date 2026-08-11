@@ -617,6 +617,24 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    enum cache_capture_mode_type {
+        CACHE_CAPTURE_MODE_ALWAYS,
+        CACHE_CAPTURE_MODE_REPEAT,
+        CACHE_CAPTURE_MODE_EXPLICIT,
+    };
+
+    // Persistent token-aligned prefix cache.  The feature is disabled when
+    // cache_disk_path is empty.  cache_write_buffer_mib == 0 means that the
+    // server derives a bounded default from one block and one recurrent
+    // snapshot.
+    std::string cache_disk_path;
+    int32_t cache_disk_size_mib       = 0;
+    int32_t cache_block_size          = 2048;
+    int32_t cache_write_buffer_mib    = 0;
+    cache_capture_mode_type cache_capture_mode = CACHE_CAPTURE_MODE_REPEAT;
+    int32_t cache_admission_items     = 8192;
+    int32_t cache_recurrent_stride    = 4;
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

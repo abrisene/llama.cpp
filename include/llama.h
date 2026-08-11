@@ -48,6 +48,12 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+// Versioned component/range state streams.  This format is intentionally
+// separate from LLAMA_STATE_SEQ_MAGIC, whose existing full-sequence behavior
+// must remain stable.
+#define LLAMA_STATE_SEQ_RANGE_MAGIC   0x67727371u // 'grsq'
+#define LLAMA_STATE_SEQ_RANGE_VERSION 2
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -68,6 +74,40 @@ extern "C" {
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;
+
+    // Components that can be selected by the range state API.
+    enum llama_state_seq_component {
+        LLAMA_STATE_SEQ_COMPONENT_ATTENTION = 1u << 0,
+        LLAMA_STATE_SEQ_COMPONENT_RECURRENT = 1u << 1,
+    };
+
+    // Capabilities advertised by a context for the range state API.
+    // Component presence and the operations supported for that component are
+    // reported independently: a present component is not necessarily safe to
+    // serialize or restore by range.
+    enum llama_state_seq_capability {
+        LLAMA_STATE_SEQ_CAPABILITY_ATTENTION                  = 1u << 0,
+        LLAMA_STATE_SEQ_CAPABILITY_RECURRENT                  = 1u << 1,
+        LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE        = 1u << 2,
+        LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE     = 1u << 3,
+        LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE     = 1u << 4,
+        LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE  = 1u << 5,
+        LLAMA_STATE_SEQ_CAPABILITY_UNIFIED_KV_RESTORE         = 1u << 6,
+        LLAMA_STATE_SEQ_CAPABILITY_ON_DEVICE                   = 1u << 7,
+        LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE  = 1u << 8,
+
+        // Descriptive aliases used by callers that want to make the restore
+        // mode explicit without changing the capability mask.
+        LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_ADD_RESTORE = LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE,
+        LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_REPLACE_RESTORE   = LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE,
+        LLAMA_STATE_SEQ_CAPABILITY_UNIFIED_KV_SAFE_RESTORE     = LLAMA_STATE_SEQ_CAPABILITY_UNIFIED_KV_RESTORE,
+        LLAMA_STATE_SEQ_CAPABILITY_MROPE_TEXT_RANGE            = LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_MROPE_TEXT_RANGE,
+    };
+
+    struct llama_state_seq_range {
+        llama_pos p0;
+        llama_pos p1;
+    };
 
     enum llama_vocab_type {
         LLAMA_VOCAB_TYPE_NONE   = 0, // For models without vocab
@@ -906,6 +946,10 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Explicit opt-in for the canonical text-only 4D M-RoPE position layout.
+// Generic multidimensional range serialization remains unsupported.
+#define LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -925,6 +969,38 @@ extern "C" {
                    const uint8_t * src,
                           size_t   size,
                     llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // Component-aware, token-position range state API.  The stream returned by
+    // these functions has LLAMA_STATE_SEQ_RANGE_MAGIC/VERSION and carries the
+    // component mask, range flags, source sequence, range, payload size, and checksum.
+    LLAMA_API uint32_t llama_state_seq_components(struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_state_seq_capabilities(struct llama_context * ctx);
+
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                    uint32_t       components,
+            struct llama_state_seq_range range,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                    uint32_t       components,
+            struct llama_state_seq_range range,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_set_data_range(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                    uint32_t       components,
+            struct llama_state_seq_range range,
            llama_state_seq_flags   flags);
 
     //

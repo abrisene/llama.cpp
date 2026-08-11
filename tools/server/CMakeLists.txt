@@ -15,6 +15,10 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-prefix-admission.cpp
+    server-prefix-admission.h
+    server-prefix-cache.cpp
+    server-prefix-cache.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

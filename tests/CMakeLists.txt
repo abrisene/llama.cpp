@@ -237,7 +237,41 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    llama_build(test-persistent-prefix-state.cpp)
+    llama_test(
+        test-persistent-prefix-state
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-persistent-prefix-state PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-persistent-prefix-state
+        NAME test-persistent-prefix-state-granite
+        LABEL main
+        ARGS -m "${MODEL_DIR}/granitehybrid-dense.gguf"
+    )
+    set_tests_properties(test-persistent-prefix-state-granite PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-persistent-prefix-state
+        NAME test-persistent-prefix-state-granite-unified
+        LABEL main
+        ARGS -m "${MODEL_DIR}/granitehybrid-dense.gguf" --test-unified
+    )
+    set_tests_properties(test-persistent-prefix-state-granite-unified PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 endif()
+
+llama_build_and_test(test-server-prefix-cache.cpp ../tools/server/server-prefix-cache.cpp)
+target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(test-server-prefix-admission.cpp ../tools/server/server-prefix-admission.cpp ../tools/server/server-prefix-cache.cpp)
+target_include_directories(test-server-prefix-admission PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)

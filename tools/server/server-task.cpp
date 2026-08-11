@@ -248,6 +248,18 @@ json result_prompt_progress::to_json() const {
     };
 }
 
+json result_persistent_cache::to_json() const {
+    return json {
+        {"requested",        requested},
+        {"eligible",         eligible},
+        {"staged_blocks",    staged_blocks},
+        {"published_blocks", published_blocks},
+        {"recurrent_sidecars", recurrent_sidecars},
+        {"durable",          durable},
+        {"reason",           reason},
+    };
+}
+
 static inline std::string stop_type_to_str(stop_type type) {
     switch (type) {
         case STOP_TYPE_EOS:   return "eos";
@@ -354,6 +366,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
+        {"persistent_cache",    persistent_cache.to_json()},
         {"timings",             stats.to_json()},
     };
     if (!stream && !probs_output.empty()) {
@@ -397,6 +410,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "text_completion"},
         {"usage",              usage_json_oaicompat()},
+        {"persistent_cache",   persistent_cache.to_json()},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -445,6 +459,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion"},
         {"usage",              usage_json_oaicompat()},
+        {"persistent_cache",   persistent_cache.to_json()},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -497,6 +512,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         {"model",              oaicompat_model},
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion.chunk"},
+        {"persistent_cache",   persistent_cache.to_json()},
     });
 
     if (include_usage) {
@@ -591,6 +607,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
+        {"persistent_cache", persistent_cache.to_json()},
     };
 
     return res;
@@ -701,7 +718,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"output_tokens", n_decoded},
                     {"total_tokens",  n_decoded + n_prompt_tokens},
                     {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-                }}
+                }},
+                {"persistent_cache", persistent_cache.to_json()}
             }},
         }}
     });

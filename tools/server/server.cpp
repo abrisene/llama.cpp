@@ -87,6 +87,18 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+static server_http_context::handler_t cache_prefix_not_implemented_handler() {
+    return [](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        json error_data = format_error_response(
+                "POST /cache/prefix requires the server-side explicit prefix capture handler",
+                ERROR_TYPE_NOT_SUPPORTED);
+        res->status = json_value(error_data, "code", 501);
+        res->data = safe_json_to_str({{ "error", error_data }});
+        return res;
+    };
+}
+
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -254,6 +266,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_apply_template         = models_routes->proxy_post;
         routes.post_chat_completions_tok   = models_routes->proxy_post;
         routes.post_responses_tok_oai      = models_routes->proxy_post;
+        routes.post_cache_prefix           = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
@@ -268,6 +281,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+    }
+
+    if (!routes.post_cache_prefix) {
+        routes.post_cache_prefix = cache_prefix_not_implemented_handler();
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
@@ -288,6 +305,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
+    ctx_http.post("/cache/prefix",             ex_wrapper(routes.post_cache_prefix));
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));

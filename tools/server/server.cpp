@@ -99,6 +99,18 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+static server_http_context::handler_t cache_prefix_not_implemented_handler() {
+    return [](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        json error_data = format_error_response(
+                "POST /cache/prefix requires the server-side explicit prefix capture handler",
+                ERROR_TYPE_NOT_SUPPORTED);
+        res->status = json_value(error_data, "code", 501);
+        res->data = safe_json_to_str({{ "error", error_data }});
+        return res;
+    };
+}
+
 //
 // shared by every role
 //
@@ -171,6 +183,10 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
 // the API of every server; a router points the handlers in routes at its proxies before calling this
 static void server_register_routes(server_http_context & ctx_http, server_routes & routes) {
+    if (!routes.post_cache_prefix) {
+        routes.post_cache_prefix = cache_prefix_not_implemented_handler();
+    }
+
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -205,6 +221,7 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+    ctx_http.post("/cache/prefix",             ex_wrapper(routes.post_cache_prefix));
     // token counting
     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
@@ -543,6 +560,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_apply_template         = models_routes->proxy_post;
     routes.post_chat_completions_tok   = models_routes->proxy_post;
     routes.post_responses_tok_oai      = models_routes->proxy_post;
+    routes.post_cache_prefix           = models_routes->proxy_post;
     routes.get_lora_adapters           = models_routes->proxy_get;
     routes.post_lora_adapters          = models_routes->lora_adapters_post;
     routes.get_slots                   = models_routes->proxy_get;

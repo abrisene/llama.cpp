@@ -76,6 +76,23 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    uint32_t state_seq_components() const override;
+    uint32_t state_seq_capabilities() const override;
+    size_t state_write_range(
+            llama_io_write_i & io,
+            llama_seq_id       seq_id,
+            uint32_t           components,
+            llama_pos          p0,
+            llama_pos          p1,
+            llama_state_seq_flags flags) const override;
+    size_t state_read_range(
+            llama_io_read_i & io,
+            llama_seq_id      dest_seq_id,
+            uint32_t          components,
+            llama_pos         p0,
+            llama_pos         p1,
+            llama_state_seq_flags flags) override;
+
     //
     // llama_memory_hybrid specific API
     //

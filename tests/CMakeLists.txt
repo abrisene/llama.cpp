@@ -260,6 +260,9 @@ endif()
 llama_build_and_test(test-server-prefix-cache.cpp ../tools/server/server-prefix-cache.cpp)
 target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+llama_build_and_test(test-server-decode-arbiter.cpp ../tools/server/server-decode-arbiter.cpp)
+target_include_directories(test-server-decode-arbiter PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
 llama_build_and_test(test-server-prefix-admission.cpp ../tools/server/server-prefix-admission.cpp ../tools/server/server-prefix-cache.cpp)
 target_include_directories(test-server-prefix-admission PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 

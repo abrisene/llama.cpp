@@ -111,6 +111,10 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    void prefix_cache_mark_explicit_precache_request();
+    void prefix_cache_mark_explicit_precache_success();
+    void prefix_cache_mark_explicit_precache_failure();
 };
 
 
@@ -156,6 +160,7 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_cache_prefix;
 
     // to be used in router mode
     json get_model_info() const;
@@ -167,7 +172,8 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type,
-            const common_chat_session & chat_session = {});
+            const common_chat_session & chat_session = {},
+            bool cache_precache = false);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
@@ -178,7 +184,8 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    server_context_impl & ctx_server;
+    server_context & ctx_server_mut;
+    const server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;

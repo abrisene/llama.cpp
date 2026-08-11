@@ -124,6 +124,50 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Component-aware, token-position range state API.  Implementations that
+    // do not support this API advertise zero components/capabilities and keep
+    // the default no-op behavior.  The context wraps these payloads in the
+    // versioned range envelope exposed by the public C API.
+    virtual uint32_t state_seq_components() const {
+        return 0;
+    }
+
+    virtual uint32_t state_seq_capabilities() const {
+        return 0;
+    }
+
+    virtual size_t state_write_range(
+            llama_io_write_i & io,
+            llama_seq_id       seq_id,
+            uint32_t           components,
+            llama_pos          p0,
+            llama_pos          p1,
+            llama_state_seq_flags flags) const {
+        (void) io;
+        (void) seq_id;
+        (void) components;
+        (void) p0;
+        (void) p1;
+        (void) flags;
+        return 0;
+    }
+
+    virtual size_t state_read_range(
+            llama_io_read_i & io,
+            llama_seq_id      dest_seq_id,
+            uint32_t          components,
+            llama_pos         p0,
+            llama_pos         p1,
+            llama_state_seq_flags flags) {
+        (void) io;
+        (void) dest_seq_id;
+        (void) components;
+        (void) p0;
+        (void) p1;
+        (void) flags;
+        return 0;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

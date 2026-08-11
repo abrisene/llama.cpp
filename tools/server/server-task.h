@@ -51,6 +51,8 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool cache_persist   = false; // force persistent prefix-cache capture for this request
+    bool cache_precache  = false; // internal /cache/prefix request waits for publication metadata
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -268,6 +270,18 @@ struct result_prompt_progress {
     json to_json() const;
 };
 
+struct result_persistent_cache {
+    bool requested = false;
+    bool eligible = false;
+    int32_t staged_blocks = 0;
+    int32_t published_blocks = 0;
+    int32_t recurrent_sidecars = 0;
+    bool durable = false;
+    std::string reason;
+
+    json to_json() const;
+};
+
 struct server_task_result {
     int id           = -1;
     int id_slot      = -1;
@@ -331,6 +345,7 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
     int32_t n_tokens_cached;
+    result_persistent_cache persistent_cache;
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;

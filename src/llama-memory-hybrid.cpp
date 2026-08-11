@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -199,6 +200,103 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
+}
+
+uint32_t llama_memory_hybrid::state_seq_components() const {
+    return mem_attn->state_seq_components() | mem_recr->state_seq_components();
+}
+
+uint32_t llama_memory_hybrid::state_seq_capabilities() const {
+    return mem_attn->state_seq_capabilities() | mem_recr->state_seq_capabilities();
+}
+
+size_t llama_memory_hybrid::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id       seq_id,
+        uint32_t           components,
+        llama_pos          p0,
+        llama_pos          p1,
+        llama_state_seq_flags flags) const {
+    const size_t n_bytes_start = io.n_bytes();
+    const uint32_t known = LLAMA_STATE_SEQ_COMPONENT_ATTENTION | LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
+    if (seq_id < 0 || p0 < 0 || p1 <= p0 || components == 0 || (components & ~known) != 0) {
+        LLAMA_LOG_ERROR("%s: invalid sequence range request (seq=%d, components=0x%x, range=[%d,%d))\n",
+                        __func__, seq_id, components, p0, p1);
+        return 0;
+    }
+
+    if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) != 0) {
+        if ((mem_attn->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
+                (mem_attn->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE) == 0) {
+            LLAMA_LOG_ERROR("%s: attention range save is unsupported\n", __func__);
+            return 0;
+        }
+        if (mem_attn->state_write_range(io, seq_id, LLAMA_STATE_SEQ_COMPONENT_ATTENTION, p0, p1, flags) == 0) {
+            return 0;
+        }
+    }
+
+    if ((components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0) {
+        if ((mem_recr->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) == 0 ||
+                (mem_recr->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE) == 0) {
+            LLAMA_LOG_ERROR("%s: recurrent boundary save is unsupported\n", __func__);
+            return 0;
+        }
+        if (mem_recr->state_write_range(io, seq_id, LLAMA_STATE_SEQ_COMPONENT_RECURRENT, p0, p1, flags) == 0) {
+            return 0;
+        }
+    }
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+size_t llama_memory_hybrid::state_read_range(
+        llama_io_read_i & io,
+        llama_seq_id      dest_seq_id,
+        uint32_t          components,
+        llama_pos         p0,
+        llama_pos         p1,
+        llama_state_seq_flags flags) {
+    const size_t n_bytes_start = io.n_bytes();
+    const uint32_t known = LLAMA_STATE_SEQ_COMPONENT_ATTENTION | LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
+    if (dest_seq_id < 0 || p0 < 0 || p1 <= p0 || components == 0 || (components & ~known) != 0) {
+        LLAMA_LOG_ERROR("%s: invalid sequence range request (seq=%d, components=0x%x, range=[%d,%d))\n",
+                        __func__, dest_seq_id, components, p0, p1);
+        return 0;
+    }
+
+    if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) != 0) {
+        if ((mem_attn->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
+                (mem_attn->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE) == 0) {
+            LLAMA_LOG_ERROR("%s: attention range restore is unsupported\n", __func__);
+            return 0;
+        }
+        if (mem_attn->state_read_range(io, dest_seq_id, LLAMA_STATE_SEQ_COMPONENT_ATTENTION, p0, p1, flags) == 0) {
+            return 0;
+        }
+    }
+
+    if ((components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0) {
+        if ((mem_recr->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) == 0 ||
+                (mem_recr->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE) == 0) {
+            LLAMA_LOG_ERROR("%s: recurrent boundary restore is unsupported\n", __func__);
+            return 0;
+        }
+        try {
+            if (mem_recr->state_read_range(io, dest_seq_id, LLAMA_STATE_SEQ_COMPONENT_RECURRENT, p0, p1, flags) == 0) {
+                // Attention may already have been published when the recurrent
+                // sidecar fails.  Remove only the just-restored attention range;
+                // other sequences and positions remain untouched.
+                mem_attn->seq_rm(dest_seq_id, p0, p1);
+                return 0;
+            }
+        } catch (...) {
+            mem_attn->seq_rm(dest_seq_id, p0, p1);
+            throw;
+        }
+    }
+
+    return io.n_bytes() - n_bytes_start;
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

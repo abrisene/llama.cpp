@@ -33,6 +33,37 @@ matrix.
 Decision: keep backend sampling enabled. It materially helps the MoE model and
 does not show a meaningful regression on the dense 9B model.
 
+### CUDA qualification (RTX 4090 + RTX 3090, Windows)
+
+The same setting re-qualified on the CUDA rig, since the M5 Max numbers say
+nothing about a different backend. Qwen3.8-27B Q6_K, 4 slots x 32k, `-ctk/-ctv
+q8_0`, `--fit on`, 256 generated tokens at temperature 0. ComfyUI was resident
+on cuda:0 throughout, so these are pessimistic in absolute terms; the
+comparison is still like-for-like.
+
+| Configuration | CPU sampling | Backend sampling | Change |
+| --- | ---: | ---: | ---: |
+| with MTP draft (`-DraftNMax 2`) | 56.71 t/s | 58.87 t/s | **+3.8%** |
+| no draft | 34.07 t/s | 34.42 t/s | +1.0% (flat) |
+
+The benefit tracks how much sampling work there is per unit time, not the
+backend as such. With MTP speculative decoding each step samples and verifies
+several tokens, so moving that off the CPU pays; with a single sample per token
+the CPU was never the bottleneck. This is the same shape as the M5 Max result,
+where the gain appeared on the model doing the most sampling work.
+
+Note `--spec-draft-backend-sampling` already defaults to **enabled** upstream,
+so the draft model's sampling was on the backend in every row above; `-bs`
+only moves the target model's.
+
+Caveat: `common/sampling.cpp` force-disables backend sampling when a grammar is
+active, so structured-output requests silently fall back to the CPU path. That
+makes `-bs` safe to leave on, but it also means grammar-constrained workloads
+will not see this gain.
+
+Decision on this rig: enable it. `start-llama-server.ps1` passes `-bs` by
+default, with `-NoBackendSampling` to opt out.
+
 ## Stage 4: bandwidth-aware model scheduling
 
 Goal: prevent independently resident model processes from degrading each

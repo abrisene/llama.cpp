@@ -910,6 +910,19 @@ struct PrefixCacheStore::Impl {
             const auto path = artifact_path(id.kind, id.key);
             std::error_code ec;
             const auto st = std::filesystem::symlink_status(path, ec);
+
+            // MSVC reports a missing path by SETTING ec (ERROR_FILE_NOT_FOUND /
+            // ERROR_PATH_NOT_FOUND) instead of returning file_type::not_found with a
+            // cleared ec, which is what the POSIX implementations do. Without
+            // normalising that, both branches below are skipped for a path that does
+            // not exist yet - i.e. every first publication - and publish_bytes()
+            // returns false having written nothing and logged nothing.
+            const bool missing = (st.type() == std::filesystem::file_type::not_found) ||
+                                 (ec == std::errc::no_such_file_or_directory);
+            if (missing) {
+                ec.clear();
+            }
+
             if (!ec && std::filesystem::is_regular_file(st)) {
                 Bytes existing_bytes; Artifact existing_artifact;
                 if (read_file(path, existing_bytes) &&
@@ -920,7 +933,7 @@ struct PrefixCacheStore::Impl {
                     actual_size = existing_bytes.size();
                     io_ok = true;
                 }
-            } else if (!ec && !std::filesystem::exists(st)) {
+            } else if (missing) {
                 const std::string suffix = ".tmp.0." + std::to_string(next_temp_nonce());
                 const auto tmp = path.string() + suffix;
                 std::ofstream output(tmp, std::ios::binary | std::ios::out);
@@ -928,10 +941,37 @@ struct PrefixCacheStore::Impl {
                     output.write(reinterpret_cast<const char *>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
                     output.flush();
                     output.close();
-                    if (!std::filesystem::exists(path)) std::filesystem::rename(tmp, path, ec);
-                    else ec = std::make_error_code(std::errc::file_exists);
-                    if (ec) std::filesystem::remove(tmp, ec);
-                    else io_ok = true;
+
+                    // Attempt the rename unconditionally rather than testing exists()
+                    // first: that test is a TOCTOU window, and Win32 rename does not
+                    // replace an existing file the way POSIX rename does, so the check
+                    // buys nothing.
+                    std::error_code rename_ec;
+                    std::filesystem::rename(tmp, path, rename_ec);
+
+                    if (!rename_ec) {
+                        io_ok = true;
+                    } else {
+                        std::error_code cleanup_ec;
+                        std::filesystem::remove(tmp, cleanup_ec);
+
+                        // Losing a race for this path is NOT a failure. Artifacts are
+                        // immutable and content-addressed, so whoever won wrote the same
+                        // bytes under the same key. The POSIX branch treats that as a
+                        // duplicate publication; do the same here instead of reporting
+                        // an error, which is what made two concurrent writers fail.
+                        Bytes existing_bytes;
+                        Artifact existing_artifact;
+                        if (read_file(path, existing_bytes) &&
+                            decode_artifact(existing_bytes, options.max_artifact_bytes, existing_artifact) &&
+                            existing_artifact.kind == id.kind &&
+                            existing_artifact.key == id.key &&
+                            existing_artifact.signature == options.signature) {
+                            duplicate   = true;
+                            actual_size = existing_bytes.size();
+                            io_ok       = true;
+                        }
+                    }
                 }
             }
 #else

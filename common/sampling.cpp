@@ -180,11 +180,11 @@ std::string common_params_sampling::print() const {
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
             "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
-            "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
+            "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, top_h = %.3f, temp = %.3f\n"
             "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, adaptive_target = %.3f, adaptive_decay = %.3f",
             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
             dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
-            top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
+            top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, top_h, temp,
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
@@ -376,6 +376,9 @@ struct common_sampler * common_sampler_init(
                     break;
                 case COMMON_SAMPLER_TYPE_TYPICAL_P:
                     samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_H:
+                    samplers.push_back(llama_sampler_init_top_h(params.top_h, params.min_keep));
                     break;
                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
                     samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
@@ -905,6 +908,7 @@ char common_sampler_type_to_chr(enum common_sampler_type cnstr) {
         case COMMON_SAMPLER_TYPE_INFILL:      return 'i';
         case COMMON_SAMPLER_TYPE_PENALTIES:   return 'e';
         case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return 'a';
+        case COMMON_SAMPLER_TYPE_TOP_H:       return 'h';
         default : return '?';
     }
 }
@@ -922,6 +926,7 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr) {
         case COMMON_SAMPLER_TYPE_INFILL:      return "infill";
         case COMMON_SAMPLER_TYPE_PENALTIES:   return "penalties";
         case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return "adaptive_p";
+        case COMMON_SAMPLER_TYPE_TOP_H:       return "top_h";
         default : return "";
     }
 }
@@ -941,7 +946,8 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
             { "xtc",         COMMON_SAMPLER_TYPE_XTC         },
             { "infill",      COMMON_SAMPLER_TYPE_INFILL      },
             { "penalties",   COMMON_SAMPLER_TYPE_PENALTIES   },
-            { "adaptive_p",  COMMON_SAMPLER_TYPE_ADAPTIVE_P  }
+            { "adaptive_p",  COMMON_SAMPLER_TYPE_ADAPTIVE_P  },
+            { "top_h",       COMMON_SAMPLER_TYPE_TOP_H       }
         };
         std::unordered_map<std::string, common_sampler_type> alias_name_map;
         for (const auto & entry : canonical_name_map) {
@@ -1001,6 +1007,7 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_INFILL),      COMMON_SAMPLER_TYPE_INFILL },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_PENALTIES),   COMMON_SAMPLER_TYPE_PENALTIES },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_ADAPTIVE_P),  COMMON_SAMPLER_TYPE_ADAPTIVE_P },
+        { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_TOP_H),       COMMON_SAMPLER_TYPE_TOP_H },
     };
 
     std::vector<common_sampler_type> samplers;

@@ -1461,6 +1461,16 @@ extern "C" {
     /// @details Top n sigma sampling as described in academic paper "Top-nσ: Not All Logits Are You Need" https://arxiv.org/pdf/2411.07641
     LLAMA_API struct llama_sampler * llama_sampler_init_top_n_sigma(float   n);
 
+    /// @details Top-H decoding, from "Top-H Decoding: Adapting the Creativity and Coherence with
+    /// Bounded Entropy in Text Generation" https://arxiv.org/abs/2509.02510
+    /// Keeps the largest prefix of most-likely tokens whose renormalised entropy stays within
+    /// alpha * H(p), where H(p) is the entropy of the full distribution. Unlike min-p, which
+    /// judges the cut from the top token alone, this adapts to the whole shape of the
+    /// distribution - so it neither over-truncates peaked steps nor under-truncates flat ones.
+    /// @param alpha    entropy fraction in (0, 1); <= 0 or >= 1 disables it. The paper uses 0.4.
+    /// @param min_keep minimum number of tokens to keep (0 = no minimum)
+    LLAMA_API struct llama_sampler * llama_sampler_init_top_h    (float alpha, size_t min_keep);
+
     /// @details Mirostat 1.0 algorithm described in the paper https://arxiv.org/abs/2007.14966. Uses tokens instead of words.
     /// @param candidates A vector of `llama_token_data` containing the candidate tokens, their probabilities (p), and log-odds (logit) for the current position in the generated text.
     /// @param tau  The target cross-entropy (or surprise) value you want to achieve for the generated text. A higher value corresponds to more surprising or less predictable text, while a lower value corresponds to less surprising or more predictable text.

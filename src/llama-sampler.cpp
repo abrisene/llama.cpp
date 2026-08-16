@@ -3312,6 +3312,126 @@ struct llama_sampler * llama_sampler_init_top_n_sigma(float n) {
     );
 }
 
+// top-h
+
+struct llama_sampler_top_h {
+    const float  alpha;
+    const size_t min_keep;
+};
+
+static const char * llama_sampler_top_h_name(const struct llama_sampler * /*smpl*/) {
+    return "top-h";
+}
+
+static void llama_sampler_top_h_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * ctx = (llama_sampler_top_h *) smpl->ctx;
+
+    if (ctx->alpha <= 0.0f || ctx->alpha >= 1.0f || cur_p->size <= 1) {
+        return;
+    }
+
+    // need probabilities, sorted descending
+    llama_sampler_softmax_impl(cur_p, true);
+
+    // entropy of the untruncated distribution
+    double h_p = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const double p = cur_p->data[i].p;
+        if (p > 0.0) {
+            h_p -= p * std::log(p);
+        }
+    }
+
+    if (!(h_p > 0.0)) {
+        // deterministic distribution - nothing to bound
+        cur_p->size = 1;
+        return;
+    }
+
+    const double limit = (double) ctx->alpha * h_p;
+
+    // Grow the candidate set while the entropy of the *renormalised* set stays
+    // within alpha * H(p). Writing S = sum(p) and T = sum(p*log p) over the kept
+    // prefix, the renormalised entropy is
+    //     H(q) = log(S) - T/S
+    // so each step is O(1) and the sums are never recomputed. H(q) is
+    // non-decreasing over a descending-sorted prefix, so the first violation is
+    // the cut point.
+    double s = 0.0;
+    double t = 0.0;
+    size_t k = 0;
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const double p = cur_p->data[i].p;
+        if (!(p > 0.0)) {
+            break;
+        }
+
+        const double s_new = s + p;
+        const double t_new = t + p * std::log(p);
+        const double h_q   = std::log(s_new) - t_new / s_new;
+
+        // a single token always has zero entropy, so it can never violate the bound
+        if (i > 0 && h_q > limit) {
+            break;
+        }
+
+        s = s_new;
+        t = t_new;
+        k = i + 1;
+    }
+
+    if (ctx->min_keep > 0 && k < ctx->min_keep) {
+        k = std::min(ctx->min_keep, cur_p->size);
+    }
+    if (k < 1) {
+        k = 1;
+    }
+
+    cur_p->size = k;
+}
+
+static struct llama_sampler * llama_sampler_top_h_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_top_h *) smpl->ctx;
+    return llama_sampler_init_top_h(ctx->alpha, ctx->min_keep);
+}
+
+static void llama_sampler_top_h_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_top_h *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_top_h_i = {
+    /* .name              = */ llama_sampler_top_h_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_top_h_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_top_h_clone,
+    /* .free              = */ llama_sampler_top_h_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_top_h(float alpha, size_t min_keep) {
+    // alpha >= 1 keeps the whole distribution, alpha <= 0 is meaningless
+    const bool is_empty = (alpha <= 0.0f || alpha >= 1.0f);
+
+    if (is_empty) {
+        return llama_sampler_init_empty("?top-h");
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_top_h_i,
+        /* .ctx   = */ new llama_sampler_top_h {
+            /* .alpha    = */ alpha,
+            /* .min_keep = */ min_keep,
+        }
+    );
+}
+
 // DRY
 
 struct llama_sampler_dry {

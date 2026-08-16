@@ -2116,6 +2116,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling());
     add_opt(common_arg(
+        {"--top-h"}, "N",
+        string_format("top-h sampling: keep the largest token set whose renormalised entropy stays\n"
+                      "within N * H(p) (default: %.2f, <= 0.0 or >= 1.0 = disabled; paper suggests 0.40)",
+                      params.sampling.top_h),
+        [](common_params & params, const std::string & value) {
+            params.sampling.top_h = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
         {"--xtc-probability"}, "N",
         string_format("xtc probability (default: %.2f, 0.0 = disabled)", (double)params.sampling.xtc_probability),
         [](common_params & params, const std::string & value) {

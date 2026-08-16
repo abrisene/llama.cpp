@@ -125,6 +125,7 @@ enum common_sampler_type {
     COMMON_SAMPLER_TYPE_PENALTIES   = 10,
     COMMON_SAMPLER_TYPE_TOP_N_SIGMA = 11,
     COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
+    COMMON_SAMPLER_TYPE_TOP_H       = 13,
 };
 
 // dimensionality reduction methods, used by cvector-generator
@@ -232,6 +233,7 @@ struct common_params_sampling {
     float   xtc_probability    = 0.00f;  // 0.0 = disabled
     float   xtc_threshold      = 0.10f;  // > 0.5 disables XTC
     float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
+    float   top_h              = -1.00f; // Top-H entropy fraction; <= 0 or >= 1 = disabled (paper: 0.4)
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
@@ -261,6 +263,9 @@ struct common_params_sampling {
         COMMON_SAMPLER_TYPE_PENALTIES,
         COMMON_SAMPLER_TYPE_DRY,
         COMMON_SAMPLER_TYPE_TOP_N_SIGMA,
+        // before top_k, so H(p) is the entropy of the real distribution rather
+        // than of an already-truncated candidate set
+        COMMON_SAMPLER_TYPE_TOP_H,
         COMMON_SAMPLER_TYPE_TOP_K,
         COMMON_SAMPLER_TYPE_TYPICAL_P,
         COMMON_SAMPLER_TYPE_TOP_P,

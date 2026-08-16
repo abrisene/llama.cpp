@@ -221,6 +221,17 @@ static void test_top_n_sigma(const std::vector<float> & probs, const std::vector
     tester.check();
 }
 
+static void test_top_h(const std::vector<float> & probs, const std::vector<float> & probs_expected, float alpha) {
+    sampler_tester tester(probs, probs_expected);
+
+    DUMP(&tester.cur_p);
+    tester.apply(llama_sampler_init_top_h(alpha, 0));
+    tester.apply(llama_sampler_init_dist (0));
+    DUMP(&tester.cur_p);
+
+    tester.check();
+}
+
 static void test_sampler_queue(const size_t n_vocab, const std::string & samplers_sequence, const int top_k, const float top_p, const float min_p
 ) {
     sampler_tester tester(n_vocab);
@@ -375,6 +386,16 @@ int main(void) {
 
     test_typical({0.97f, 0.01f, 0.01f, 0.01f}, {0.97f},            0.5f);
     test_typical({0.4f, 0.2f, 0.2f, 0.2f},     {0.2f, 0.2f, 0.2f}, 0.5f);
+
+    // Top-H. For a uniform 4-way split H(p) = ln 4 = 1.3863, so the bound is 0.6*ln4 = 0.8318.
+    // Keeping 2 tokens gives ln 2 = 0.6931 (under), keeping 3 gives ln 3 = 1.0986 (over),
+    // so exactly two survive and renormalise to a half each.
+    test_top_h({0.25f, 0.25f, 0.25f, 0.25f}, {0.5f, 0.5f},                   0.6f);
+    // A peaked distribution has little entropy to spend (H(p) = 0.1677); a tight bound
+    // collapses it to the single top token. This is the case min-p over-truncates.
+    test_top_h({0.97f, 0.01f, 0.01f, 0.01f}, {1.0f},                         0.1f);
+    // alpha >= 1 bounds nothing, so the sampler must be a no-op
+    test_top_h({0.25f, 0.25f, 0.25f, 0.25f}, {0.25f, 0.25f, 0.25f, 0.25f},   1.0f);
 
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0}, {0, 0.25f, 0.25f, 0.25f, 0.25f},   50.0f, 0.0f, 0.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2}, {0, 0, 0, 0.5f, 0.5f},       50.0f, 0.0f, 0.0f);

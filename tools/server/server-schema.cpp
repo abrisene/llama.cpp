@@ -104,6 +104,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("top_n_sigma", params.sampling.top_n_sigma))
         ->set_desc("Keep tokens within n standard deviations of the top token logit (< 0 = disabled)"));
 
+    add((new field_num("top_h", params.sampling.top_h))
+        ->set_desc("Top-H: keep the largest token set whose renormalised entropy stays within this fraction of the full distribution's entropy (<= 0 or >= 1 = disabled; 0.4 suggested)"));
+
     add((new field_num("xtc_probability", params.sampling.xtc_probability))
         ->set_limits(0.0f, 1.0f)
         ->set_desc("Set the chance for token removal via XTC sampler (0 = disabled)"));

@@ -1,5 +1,7 @@
 #include "server-queue.h"
 
+#include "ggml.h"
+
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -15,8 +17,11 @@ static bool test_single_request_has_no_wait() {
     queue.set_admission_coalesce(50000, 4);
 
     std::atomic<int> processed{0};
-    queue.on_new_task([&](server_task &&) {
+    // upstream's callback takes an is_yielding flag and returns whether the task
+    // was accepted; these tests never yield, so always accept
+    queue.on_new_task([&](server_task &&, bool) {
         processed.fetch_add(1, std::memory_order_relaxed);
+        return true;
     });
     queue.on_has_batch_capacity([&]() {
         return processed.load(std::memory_order_relaxed) < 4;
@@ -37,8 +42,11 @@ static bool test_burst_collects_late_request() {
     queue.set_admission_coalesce(50000, 3);
 
     std::atomic<int> processed{0};
-    queue.on_new_task([&](server_task &&) {
+    // upstream's callback takes an is_yielding flag and returns whether the task
+    // was accepted; these tests never yield, so always accept
+    queue.on_new_task([&](server_task &&, bool) {
         processed.fetch_add(1, std::memory_order_relaxed);
+        return true;
     });
     queue.on_has_batch_capacity([&]() {
         return processed.load(std::memory_order_relaxed) < 3;
@@ -68,8 +76,11 @@ static bool test_full_batch_has_no_wait() {
     queue.set_admission_coalesce(50000, 2);
 
     std::atomic<int> processed{0};
-    queue.on_new_task([&](server_task &&) {
+    // upstream's callback takes an is_yielding flag and returns whether the task
+    // was accepted; these tests never yield, so always accept
+    queue.on_new_task([&](server_task &&, bool) {
         processed.fetch_add(1, std::memory_order_relaxed);
+        return true;
     });
     queue.on_has_batch_capacity([&]() {
         return processed.load(std::memory_order_relaxed) < 2;
@@ -90,8 +101,11 @@ static bool test_timeout_shrinks_window() {
     queue.set_admission_coalesce(20000, 3);
 
     std::atomic<int> processed{0};
-    queue.on_new_task([&](server_task &&) {
+    // upstream's callback takes an is_yielding flag and returns whether the task
+    // was accepted; these tests never yield, so always accept
+    queue.on_new_task([&](server_task &&, bool) {
         processed.fetch_add(1, std::memory_order_relaxed);
+        return true;
     });
     queue.on_has_batch_capacity([&]() {
         return true;
@@ -110,6 +124,11 @@ static bool test_timeout_shrinks_window() {
 }
 
 int main() {
+    // required on Windows: ggml_time_ms/us divide by a timer frequency that stays
+    // zero until this runs, so the queue's ggml_time_ms() call would trap.
+    // normally llama_backend_init() does this, but these tests never load a model.
+    ggml_time_init();
+
     return test_single_request_has_no_wait() &&
            test_burst_collects_late_request() &&
            test_full_batch_has_no_wait() &&

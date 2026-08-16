@@ -1680,7 +1680,9 @@ private:
         if (!slot.task->params.cache_prompt) {
             return reject("prompt_cache_disabled");
         }
-        if (tokens.has_media() || tokens.has_mtmd) {
+        // note: upstream dropped server_tokens::has_media(); map_idx_to_media is private,
+        // so probe it through the public find_next_media_chunk() instead
+        if (tokens.has_mtmd || tokens.find_next_media_chunk(0).first != nullptr) {
             return reject("media");
         }
         for (size_t i = 0; i < tokens.size(); ++i) {

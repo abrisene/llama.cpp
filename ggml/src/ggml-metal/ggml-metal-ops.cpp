@@ -3293,6 +3293,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             !has_sinks && !has_bias && !has_scap &&
             (!has_mask || ne32 == 1);
         const int nhptg = use_gqa2 ? 2 : 1; // heads per threadgroup
+        if (use_gqa2) {
+            // The paired-head kernel is the Q=1 baseline specialization.
+            cfg   = ggml_metal_tuning::fa_vec_baseline_cfg((int) ne00, (int) ne20);
+            nqptg = cfg.Q;
+        }
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg == 1 || nqptg == 2 || nqptg == 4);  // only instantiated Q values

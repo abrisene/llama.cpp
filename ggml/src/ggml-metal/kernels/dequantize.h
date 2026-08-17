@@ -346,6 +346,14 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
     }
 }
 
+template <typename type4>
+void dequantize_q8_0_t4_packed(device const block_q8_0 * xb, short il, thread type4 & reg) {
+    device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
+    const float d = xb->d;
+
+    reg = (type4) (float4(qs[il]) * d);
+}
+
 template <typename type4x4>
 void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & reg) {
     device const uint8_t * q2 = (device const uint8_t *)xb->qs;

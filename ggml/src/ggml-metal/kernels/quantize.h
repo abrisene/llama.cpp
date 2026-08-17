@@ -206,6 +206,31 @@ void quantize_iq4_nl(device const float * src, device block_iq4_nl & dst) {
             amax = fabs(v);
             max  = v;
         }
+    }
+
+    const float d = max / kvalues_iq4nl_f[0];
+    const float id = d ? 1.0f/d : 0.0f;
+
+    float sumqx = 0, sumq2 = 0;
+    for (int j = 0; j < QK4_NL/2; ++j) {
+        const float x0 = src[0        + j]*id;
+        const float x1 = src[QK4_NL/2 + j]*id;
+
+        const uint8_t xi0 = best_index_int8(16, kvalues_iq4nl_f, x0);
+        const uint8_t xi1 = best_index_int8(16, kvalues_iq4nl_f, x1);
+
+        dst.qs[j] = xi0 | (xi1 << 4);
+
+        const float v0 = kvalues_iq4nl_f[xi0];
+        const float v1 = kvalues_iq4nl_f[xi1];
+        const float w0 = src[0        + j]*src[0        + j];
+        const float w1 = src[QK4_NL/2 + j]*src[QK4_NL/2 + j];
+        sumqx += w0*v0*src[j] + w1*v1*src[QK4_NL/2 + j];
+        sumq2 += w0*v0*v0 + w1*v1*v1;
+
+    }
+
+    dst.d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
 void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
@@ -233,29 +258,4 @@ void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
         }
         src += 4*32;
     }
-}
-
-    const float d = max / kvalues_iq4nl_f[0];
-    const float id = d ? 1.0f/d : 0.0f;
-
-    float sumqx = 0, sumq2 = 0;
-    for (int j = 0; j < QK4_NL/2; ++j) {
-        const float x0 = src[0        + j]*id;
-        const float x1 = src[QK4_NL/2 + j]*id;
-
-        const uint8_t xi0 = best_index_int8(16, kvalues_iq4nl_f, x0);
-        const uint8_t xi1 = best_index_int8(16, kvalues_iq4nl_f, x1);
-
-        dst.qs[j] = xi0 | (xi1 << 4);
-
-        const float v0 = kvalues_iq4nl_f[xi0];
-        const float v1 = kvalues_iq4nl_f[xi1];
-        const float w0 = src[0        + j]*src[0        + j];
-        const float w1 = src[QK4_NL/2 + j]*src[QK4_NL/2 + j];
-        sumqx += w0*v0*src[j] + w1*v1*src[QK4_NL/2 + j];
-        sumq2 += w0*v0*v0 + w1*v1*v1;
-
-    }
-
-    dst.d = sumq2 > 0 ? sumqx/sumq2 : d;
 }

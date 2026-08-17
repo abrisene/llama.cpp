@@ -717,3 +717,20 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     }
 }
 
+template <typename type4x4>
+void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    const float d = xb->d;
+
+    float4x4 reg_f;
+
+    const short base = il * 16;
+    for (int k = 0; k < 16; k++) {
+        const int i = base + k;
+        const int byte = ((i >> 7) & 1) * 32 + (i & 31);
+        const int l = (i >> 5) & 3;
+        reg_f[k/4][k%4] = d * (float) (((qs[byte] >> (2*l)) & 3) - 1);
+    }
+
+    reg = (type4x4) reg_f;
+}

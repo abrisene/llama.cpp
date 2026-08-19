@@ -148,7 +148,7 @@ export type {
 	ServerStatus,
 	ToolCallParams,
 	ToolExecutionResult,
-	ServerBuiltinToolInfo,
+	ServerToolInfo,
 	Tool,
 	Prompt,
 	GetPromptResult,
@@ -209,7 +209,7 @@ export type {
 export type { DesktopIconStripItem } from './navigation';
 
 // Tools types
-export type { ToolEntry, ToolGroup, BuiltinToolUiEntry } from './tools';
+export type { ToolEntry, ToolGroup, ToolUiEntry } from './tools';
 
 // Reasoning
 export type { ReasoningEffortLevel } from './reasoning';

@@ -338,9 +338,12 @@ export interface ChatFormActionsContext {
 	readonly hasVisionModality: boolean;
 	readonly hasMcpPromptsSupport: boolean;
 	readonly hasMcpResourcesSupport: boolean;
+	readonly showPrecachePrefix: boolean;
+	readonly precachePrefixDisabled: boolean;
 	onFileUpload?: () => void;
 	onSystemPromptClick?: () => void;
 	onMcpPromptClick?: () => void;
 	onMcpResourcesClick?: () => void;
 	onMcpSettingsClick?: () => void;
+	onPrecachePrefix?: () => Promise<void>;
 }

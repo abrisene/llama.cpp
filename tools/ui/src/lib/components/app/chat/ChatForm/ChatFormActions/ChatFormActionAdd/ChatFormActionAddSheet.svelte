@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { File, FolderOpen, MessageSquare, Zap } from '@lucide/svelte';
+	import { Database, File, FolderOpen, LoaderCircle, MessageSquare, TriangleAlert, Zap } from '@lucide/svelte';
 	import {
 		Check,
 		ChevronDown,
@@ -26,7 +26,7 @@
 	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
 	import { useToolsPanel } from '$lib/hooks/use-tools-panel.svelte';
 	import { conversationsStore, mcpStore } from '$lib/stores';
-	import type { Snippet } from 'svelte';
+	import { onDestroy, type Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -42,6 +42,8 @@
 	let filesExpanded = $state(true);
 	let toolsExpanded = $state(false);
 	let mcpExpanded = $state(false);
+	let precacheState = $state<'idle' | 'working' | 'complete' | 'failed'>('idle');
+	let precacheResetTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const attachmentMenu = useAttachmentMenu(
 		() => ({
@@ -72,6 +74,37 @@
 		'flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-accent';
 
 	let mcpServers = $derived(mcpStore.getServers());
+
+	function queuePrecacheStateReset() {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheResetTimer = setTimeout(() => {
+			precacheState = 'idle';
+		}, 2400);
+	}
+
+	async function handlePrecachePrefixClick() {
+		const precache = chatFormActions.onPrecachePrefix;
+
+		if (!precache || chatFormActions.precachePrefixDisabled || precacheState === 'working') return;
+
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheState = 'working';
+
+		try {
+			await precache();
+			precacheState = 'complete';
+		} catch {
+			precacheState = 'failed';
+		} finally {
+			queuePrecacheStateReset();
+		}
+	}
+
+	onDestroy(() => {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+	});
 </script>
 
 <div class="flex items-center gap-1 {className}">
@@ -338,6 +371,29 @@
 
 					<span>System Message</span>
 				</button>
+
+				{#if chatFormActions.showPrecachePrefix && chatFormActions.onPrecachePrefix}
+					<button
+						type="button"
+						class={sheetItemClass}
+						disabled={chatFormActions.precachePrefixDisabled || precacheState === 'working'}
+						onclick={handlePrecachePrefixClick}
+					>
+						{#if precacheState === 'working'}
+							<LoaderCircle class="{ICON_CLASS_DEFAULT} shrink-0 animate-spin" />
+							<span>Caching prefix</span>
+						{:else if precacheState === 'complete'}
+							<Check class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Prefix cached</span>
+						{:else if precacheState === 'failed'}
+							<TriangleAlert class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache failed</span>
+						{:else}
+							<Database class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache prefix</span>
+						{/if}
+					</button>
+				{/if}
 
 				{#if chatFormActions.hasMcpPromptsSupport}
 					<button

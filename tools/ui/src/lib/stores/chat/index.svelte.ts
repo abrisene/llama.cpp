@@ -33,6 +33,7 @@ import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import type {
 	ApiChatMessageData,
+	ApiPrefixCacheResponse,
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	ChatStreamCallbacks,
@@ -550,6 +551,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 
 		await this.addMessage(MessageRole.USER, content, MessageType.TEXT, '-1', undefined, true);
+	}
+
+	async precachePrefix(
+		content = '',
+		extras?: DatabaseMessageExtra[]
+	): Promise<ApiPrefixCacheResponse> {
+		return this.flows.precachePrefix(content, extras);
 	}
 
 	async regenerateMessage(messageId: string): Promise<void> {

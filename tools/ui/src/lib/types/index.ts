@@ -19,6 +19,7 @@ export type {
 	ApiModelListResponse,
 	ApiLlamaCppServerProps,
 	ApiChatCompletionRequest,
+	ApiPrefixCacheResponse,
 	ApiChatCompletionToolCallFunctionDelta,
 	ApiChatCompletionToolCallDelta,
 	ApiChatCompletionToolCall,

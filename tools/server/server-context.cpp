@@ -10,6 +10,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-decode-arbiter.h"
 #include "server-prefix-admission.h"
 #include "server-prefix-cache.h"
 
@@ -1738,6 +1739,8 @@ private:
 
     std::unique_ptr<server_prefix_cache::PrefixAdmission> prefix_cache_admission;
 
+    server_decode_arbiter decode_arbiter;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -3029,6 +3032,18 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * path = getenv("LLAMA_SERVER_DECODE_ARBITER");
+            if (path != nullptr && path[0] != '\0') {
+                std::string error;
+                if (!decode_arbiter.open(path, error)) {
+                    SRV_ERR("%s\n", error.c_str());
+                    return false;
+                }
+                SRV_INF("cross-model decode arbiter enabled: %s\n", path);
             }
         }
 
@@ -6231,6 +6246,19 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        bool has_generation = false;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.is_processing()) {
+                has_generation = true;
+                break;
+            }
+        }
+
+        // Hold the cross-model decode lease for the whole decode. Upstream moved
+        // llama_decode inside yield_to_queue(); the lease is RAII and stays in
+        // scope across that call, so the arbiter still serialises decodes.
+        auto decode_lease = has_generation ? decode_arbiter.acquire() : server_decode_arbiter::lease{};
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -6319,6 +6347,12 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+        if (decode_lease) {
+            // llama_decode() submits backend work asynchronously. Keep the
+            // cross-process lease until the Metal work is actually complete;
+            // otherwise the arbiter would only serialize command submission.
+            llama_synchronize(ctx_tgt);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -6863,6 +6897,19 @@ void server_context::reset_metrics_bucket() {
     impl->reset_metrics_bucket();
 }
 
+json server_context::decode_arbiter_json() const {
+    const auto stats = impl->decode_arbiter.stats();
+    return {
+        {"enabled",      stats.enabled},
+        {"acquisitions", stats.acquisitions},
+        {"contentions",  stats.contentions},
+        {"handoffs",     stats.contentions},
+        {"concurrent_demand", stats.contentions},
+        {"wait_us",      stats.wait_us},
+        {"hold_us",      stats.hold_us},
+    };
+}
+
 //
 // server_routes
 //
@@ -7228,10 +7275,11 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
-static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping, const json & prefix_cache_props) {
+static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping,
+                           const json & prefix_cache_props, const json & decode_arbiter_props) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
-    // the prefix_cache_props value must be computed by the caller (from a context where
-    // touching ctx_server is safe) and passed in
+    // the prefix_cache_props/decode_arbiter_props values must be computed by the caller (from a
+    // context where touching ctx_server is safe) and passed in
 
     task_params tparams;
     tparams.sampling = params.sampling;
@@ -7260,6 +7308,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_metrics",            params.endpoint_metrics },
         { "ui",                          params.ui },
         { "prefix_cache",                prefix_cache_props },
+        { "decode_arbiter",              decode_arbiter_props },
         { "ui_settings",                 meta.json_ui_settings },
         { "chat_template",               tmpl_default },
         { "chat_template_caps",          meta.chat_template_caps },
@@ -7443,13 +7492,15 @@ void server_routes::init_routes() {
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
-        // (the prefix_cache field of cached_props is populated by update_cached_responses,
-        // which runs on the queue thread where touching ctx_server is safe)
+        // (the prefix_cache/decode_arbiter fields of cached_props are populated by
+        // update_cached_responses, which runs on the queue thread where touching ctx_server is safe)
         if (queue_tasks.is_sleeping()) {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false, this->ctx_server.prefix_cache_json()));
+            res->ok(get_res_props(*meta, params, false,
+                                   this->ctx_server.prefix_cache_json(),
+                                   this->ctx_server_mut.decode_arbiter_json()));
         }
         return res;
     };
@@ -8899,7 +8950,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
     if (is_sleeping) {
         cached_models  = get_res_models(*meta);
-        cached_props   = get_res_props(*meta, params, true, ctx_server.prefix_cache_json());
+        cached_props   = get_res_props(*meta, params, true, ctx_server.prefix_cache_json(), ctx_server_mut.decode_arbiter_json());
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;

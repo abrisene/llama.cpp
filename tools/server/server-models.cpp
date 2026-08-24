@@ -34,6 +34,9 @@
 
 #ifndef _WIN32
 extern char **environ;
+#include <unistd.h>
+#else
+#include <process.h>
 #endif
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
@@ -53,6 +56,14 @@ static void request_child_exit(server_subproc & proc) {
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
 #define CHILD_ADDR "127.0.0.1"
+
+static int server_process_id() {
+#if defined(_WIN32)
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
 
 // single-threaded, watching all child processes at once
 struct server_monitor {
@@ -439,6 +450,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_MEMORY_MARGIN");
+    preset.unset_option("LLAMA_ARG_MODELS_DECODE_ARBITER");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     preset.unset_option("LLAMA_ARG_CONNECT");
@@ -581,6 +593,14 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
     unfinished_downloads.load();
+
+    if (base_params.models_decode_arbiter) {
+        const uint64_t nonce = ((uint64_t) std::random_device{}() << 32) ^ std::random_device{}();
+        decode_arbiter_path = (std::filesystem::temp_directory_path() /
+                ("llama-server-decode-" + std::to_string(server_process_id()) + "-" +
+                 std::to_string(nonce) + ".lock")).string();
+    }
+
     const size_t memory_margin = (size_t) base_params.models_memory_margin * 1024 * 1024;
     if (memory_margin > 0) {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1587,6 +1607,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        if (base_params.models_decode_arbiter) {
+            child_env.push_back("LLAMA_SERVER_DECODE_ARBITER=" + decode_arbiter_path);
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -2913,6 +2936,7 @@ void server_models_routes::init_routes() {
                 {"role",                 "router"},
                 {"max_instances",        params.models_max},
                 {"models_autoload",      params.models_autoload},
+                {"decode_arbiter",        params.models_decode_arbiter},
                 // this is a dummy response to make sure the UI doesn't break
                 {"model_alias", "llama-server"},
                 {"model_path",  "none"},

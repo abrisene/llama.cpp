@@ -3355,7 +3355,22 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ne11, ne01);
         int nqptg = cfg.Q;                             // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
-        const int nhptg = 1;                           // heads per threadgroup
+
+        const int64_t gqa_ratio = ne02/ne12;
+        const bool use_gqa2 =
+            !use_kv_f16 &&
+            op->src[1]->type == GGML_TYPE_Q8_0 &&
+            ne00 == 256 && ne20 == 256 &&
+            ne01 == 1 && ne11 >= 1024 &&
+            ne02 % ne12 == 0 && ne02 % 2 == 0 && gqa_ratio % 2 == 0 &&
+            !has_sinks && !has_bias && !has_scap &&
+            (!has_mask || ne32 == 1);
+        const int nhptg = use_gqa2 ? 2 : 1; // heads per threadgroup
+        if (use_gqa2) {
+            // The paired-head kernel is the Q=1 baseline specialization.
+            cfg   = ggml_metal_tuning::fa_vec_baseline_cfg((int) ne00, (int) ne20);
+            nqptg = cfg.Q;
+        }
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg == 1 || nqptg == 2 || nqptg == 4);  // only instantiated Q values
@@ -3481,7 +3496,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, nhptg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 

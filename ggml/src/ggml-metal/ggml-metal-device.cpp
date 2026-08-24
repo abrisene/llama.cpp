@@ -1551,7 +1551,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         int32_t nwg,
         bool    use_kv_f16,
         int32_t ns10,
-        int32_t ns20) {
+        int32_t ns20,
+        int32_t nhptg) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1560,7 +1561,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
+    const char * type   = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
+    const char * kernel = nhptg == 2 ? "flash_attn_ext_vec_gqa2" : "flash_attn_ext_vec";
 
     char qne_suffix[16] = {0};
     if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {
@@ -1568,7 +1570,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     }
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d%s",
-            "flash_attn_ext_vec",
+            kernel,
             type,
             dk,
             dv,

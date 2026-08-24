@@ -52,7 +52,10 @@
 #include <unistd.h>
 #endif
 
-using json = nlohmann::ordered_json;
+// note: server-common.h already declares `using json = common_json;` at namespace scope.
+// The persistent-prefix-cache code originally used nlohmann::ordered_json directly; if
+// key-order-sensitive serialization is needed here, use nlohmann::ordered_json explicitly
+// at the call site rather than re-aliasing `json` (which conflicts with server-common.h).
 
 namespace {
 
@@ -1702,6 +1705,11 @@ private:
         const auto admission_stats = prefix_cache_admission
             ? prefix_cache_admission->stats()
             : server_prefix_cache::AdmissionStats{};
+        // common_json has no map<string,uint64_t> constructor overload; build the sub-object explicitly.
+        json ineligible_reasons_j = json::object();
+        for (const auto & entry : prefix_cache_metrics.ineligible_reasons) {
+            ineligible_reasons_j[entry.first] = entry.second;
+        }
         json result = {
             { "enabled", !params_base.cache_disk_path.empty() },
             { "disk_path", params_base.cache_disk_path },
@@ -1745,7 +1753,7 @@ private:
             { "materialize_us", prefix_cache_metrics.materialize_us },
             { "serialize_us", prefix_cache_metrics.serialize_us },
             { "queue_us", prefix_cache_metrics.queue_us },
-            { "ineligible_reasons", prefix_cache_metrics.ineligible_reasons },
+            { "ineligible_reasons", ineligible_reasons_j },
         };
         if (prefix_cache) {
             const auto stats = prefix_cache->stats();
@@ -6455,6 +6463,10 @@ void server_context::prefix_cache_mark_explicit_precache_failure() {
     impl->prefix_cache_metrics.explicit_precache_failures++;
 }
 
+void server_context::reset_metrics_bucket() {
+    impl->reset_metrics_bucket();
+}
+
 //
 // server_routes
 //
@@ -8052,7 +8064,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
     } else if (should_reset_buckets) {
         // a scrape during sleep already reported these buckets
-        ctx_server.reset_metrics_bucket();
+        ctx_server_mut.reset_metrics_bucket();
 
         should_reset_buckets = false;
     }

@@ -38,6 +38,11 @@ does not show a meaningful regression on the dense 9B model.
 Goal: prevent independently resident model processes from degrading each
 other's generated-token rate when both submit Metal decode work.
 
+Implementation status: the short-lease arbiter is implemented behind
+`--models-decode-arbiter`. The production throughput policy remains concurrent
+decode because the focused simultaneous-model sample was faster with the
+arbiter bypassed.
+
 Required behavior:
 
 - coordinate decode ownership in the router, not in individual model kernels;
@@ -48,14 +53,36 @@ Required behavior:
 - provide a bypass mode for comparison and recovery;
 - preserve normal continuous batching inside each model process.
 
-The scheduler must optimize the selected policy explicitly:
+The POSIX implementation uses one shared advisory file lock whose path is
+passed to router children. A child acquires it only for a generation decode
+step, including speculative follow-up. Prompt decode, cache reads, and model
+residency do not take the lease. Child properties expose acquisition,
+contention, handoff, concurrent-demand, wait, and hold counters. Because one
+child has one decode thread, each contended acquisition is both observed
+concurrent demand and a handoff from another child.
+
+The router operator selects the policy explicitly:
 
 - interactive mode favors per-request t/s and predictable latency;
 - throughput mode permits concurrent decode when it improves combined t/s.
 
-Implementation must not assume that serial execution is always faster. The
-admission decision will use measured active-model demand and rolling decode
-timings.
+The deployment decision must not assume that serial execution is always
+faster. It is made from simultaneous-model measurements and remains reversible
+through the bypass flag.
+
+### M5 Max policy qualification
+
+Three simultaneous 128-token samples were taken with Qwen3.5 9B and
+Qwen3.6 35B-A3B resident. This is a narrow policy qualification, not the
+deferred tuning matrix.
+
+| Policy | Median effective combined rate | Decision |
+| --- | ---: | --- |
+| Concurrent child decode | 102.71 t/s | production default |
+| Short serialized leases | 82.64 t/s | available for latency/fairness diagnosis |
+
+Serialization reduced combined throughput by about 19.5% on this pair. The
+correct throughput setting for this machine is therefore the bypass mode.
 
 ## Stage 5: adaptive decode microbatching
 

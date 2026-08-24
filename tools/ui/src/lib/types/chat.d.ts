@@ -333,7 +333,10 @@ export interface ChatFormActionsContext {
 	readonly hasAudioModality: boolean;
 	readonly hasVideoModality: boolean;
 	readonly hasVisionModality: boolean;
+	readonly showPrecachePrefix: boolean;
+	readonly precachePrefixDisabled: boolean;
 	onFileUpload?: () => void;
 	onSystemPromptClick?: () => void;
 	onMcpSettingsClick?: () => void;
+	onPrecachePrefix?: () => Promise<void>;
 }

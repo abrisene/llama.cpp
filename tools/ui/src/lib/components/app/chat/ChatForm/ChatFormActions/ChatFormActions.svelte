@@ -13,7 +13,13 @@
 	import { setChatFormActionsContext } from '$lib/contexts';
 	import { FileTypeCategory, MessageRole } from '$lib/enums';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
+	import {
+		chatStore,
+		conversationsStore,
+		modelsStore,
+		serverStore,
+		settingsStore
+	} from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -21,6 +27,7 @@
 		canSubmit?: boolean;
 		class?: string;
 		disabled?: boolean;
+		activeModelId?: string | null;
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
@@ -32,6 +39,7 @@
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
 		onMcpSettingsClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 	}
 
 	let {
@@ -39,12 +47,14 @@
 		canSubmit = false,
 		class: className = '',
 		disabled = false,
+		activeModelId = null,
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
 		onFileUpload,
 		onMcpSettingsClick,
 		onMicClick,
+		onPrecachePrefix,
 		onStop,
 		onSystemPromptClick,
 		showAddButton = true,
@@ -67,6 +77,20 @@
 	let shouldShowRecordButton = $derived(
 		hasAudioModality && !canSubmit && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
+	let selectedModelProps = $derived.by(() => {
+		if (!serverStore.isRouterMode) return serverStore.props;
+
+		if (!activeModelId) return null;
+
+		const cached = modelsStore.props.getModelProps(activeModelId);
+
+		if (!cached) {
+			void modelsStore.props.fetchModelProps(activeModelId);
+		}
+
+		return cached;
+	});
+	let showPrecachePrefix = $derived(selectedModelProps?.prefix_cache?.enabled === true);
 
 	let selectorModelRef: ChatFormActionModels | undefined = $state(undefined);
 
@@ -140,6 +164,15 @@
 		},
 		get onSystemPromptClick() {
 			return onSystemPromptClick;
+		},
+		get onPrecachePrefix() {
+			return onPrecachePrefix;
+		},
+		get precachePrefixDisabled() {
+			return isLoading || disabled;
+		},
+		get showPrecachePrefix() {
+			return showPrecachePrefix;
 		}
 	});
 </script>

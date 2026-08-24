@@ -19,7 +19,11 @@ import { DatabaseService } from '$lib/services/database.service';
 import type { ChatProcessingStore } from '$lib/stores/chat/processing.svelte';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
+import { mcpResourceStore } from '$lib/stores/mcp/resources.svelte';
+import { modelsStore } from '$lib/stores/models/index.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import type {
+	ApiPrefixCacheResponse,
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	DatabaseMessage,
@@ -32,6 +36,7 @@ import {
 	findDescendantMessages,
 	findLeafNode,
 	findMessageById,
+	getConversationModel,
 	isAbortError
 } from '$lib/utils';
 
@@ -523,6 +528,56 @@ export class ChatMessageFlows {
 		}
 
 		return { assistantMessages, messageTypes, totalCount: allToDelete.length, userMessages };
+	}
+
+	/**
+	 * Explicitly precaches the active conversation (plus an optional draft
+	 * message) as a persistent prefix, without generating a response.
+	 */
+	async precachePrefix(
+		content = '',
+		extras?: DatabaseMessageExtra[]
+	): Promise<ApiPrefixCacheResponse> {
+		const activeConv = conversationsStore.activeConversation;
+
+		if (activeConv && this.host.isChatLoadingInternal(activeConv.id)) {
+			throw new Error('Generation is active');
+		}
+
+		this.host.cancelPreEncode();
+
+		const messages = conversationsStore.activeMessages.slice() as DatabaseMessage[];
+		const resourceExtras = mcpResourceStore.toMessageExtras();
+		const draftExtras =
+			resourceExtras.length > 0 ? [...(extras || []), ...resourceExtras] : extras;
+		const draftContent = content.trim();
+
+		if (draftContent || (draftExtras && draftExtras.length > 0)) {
+			messages.push({
+				children: [],
+				content: draftContent,
+				convId: activeConv?.id ?? 'precache-prefix-draft',
+				extra: draftExtras,
+				id: 'precache-prefix-draft',
+				parent: messages[messages.length - 1]?.id ?? null,
+				role: MessageRole.USER,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+		}
+
+		let effectiveModel: string | null | undefined = undefined;
+
+		if (serverStore.isRouterMode) {
+			effectiveModel = modelsStore.selectedModelName || getConversationModel(messages);
+		}
+
+		return ChatService.precachePrefix(messages, {
+			...this.host.getApiOptions(),
+			...(effectiveModel ? { model: effectiveModel } : {}),
+			stream: false
+		});
 	}
 
 	async regenerateMessage(messageId: string): Promise<void> {

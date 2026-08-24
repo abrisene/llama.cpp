@@ -742,6 +742,7 @@ struct common_params {
     std::string models_preset = "";     // directory containing model presets for the router server
     int models_max = 4;                 // maximum number of models to load simultaneously
     int models_memory_margin = 0;       // MiB of device memory to keep free when loading models (0 = no memory accounting)
+    bool models_decode_arbiter = false;  // serialize short generation decode leases across resident model processes
     bool models_autoload = true;        // automatically load models when requested via the router server
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 

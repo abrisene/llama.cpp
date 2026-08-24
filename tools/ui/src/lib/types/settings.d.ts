@@ -83,6 +83,7 @@ export interface SettingsChatServiceOptions {
 	model?: string;
 	// System message to inject
 	systemMessage?: string;
+	custom?: string | Record<string, unknown>;
 	// Disable reasoning parsing (use 'none' instead of 'auto')
 	disableReasoningParsing?: boolean;
 	// Strip reasoning content from context before sending

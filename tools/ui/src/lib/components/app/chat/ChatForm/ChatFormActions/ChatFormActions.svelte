@@ -15,7 +15,13 @@
 	import { FileTypeCategory, MessageRole } from '$lib/enums';
 	import { useChatFormModel } from '$lib/hooks/use-chat-form-model.svelte';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
+	import {
+		chatStore,
+		conversationsStore,
+		modelsStore,
+		serverStore,
+		settingsStore
+	} from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -23,6 +29,7 @@
 		canSubmit?: boolean;
 		class?: string;
 		disabled?: boolean;
+		activeModelId?: string | null;
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
@@ -33,6 +40,7 @@
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 	}
 
 	let {
@@ -40,11 +48,13 @@
 		canSubmit = false,
 		class: className = '',
 		disabled = false,
+		activeModelId = null,
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
 		onFileUpload,
 		onMicClick,
+		onPrecachePrefix,
 		onStop,
 		onSystemPromptClick,
 		showAddButton = true,
@@ -75,6 +85,20 @@
 	let shouldShowRecordButton = $derived(
 		hasAudioModality && !canSubmit && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
+	let selectedModelProps = $derived.by(() => {
+		if (!serverStore.isRouterMode) return serverStore.props;
+
+		if (!activeModelId) return null;
+
+		const cached = modelsStore.props.getModelProps(activeModelId);
+
+		if (!cached) {
+			void modelsStore.props.fetchModelProps(activeModelId);
+		}
+
+		return cached;
+	});
+	let showPrecachePrefix = $derived(selectedModelProps?.prefix_cache?.enabled === true);
 
 	let selectorModelRef: ModelsSelector | undefined = $state(undefined);
 
@@ -145,6 +169,15 @@
 		},
 		get onSystemPromptClick() {
 			return onSystemPromptClick;
+		},
+		get onPrecachePrefix() {
+			return onPrecachePrefix;
+		},
+		get precachePrefixDisabled() {
+			return isLoading || disabled;
+		},
+		get showPrecachePrefix() {
+			return showPrecachePrefix;
 		}
 	});
 </script>

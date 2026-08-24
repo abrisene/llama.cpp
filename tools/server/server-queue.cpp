@@ -135,7 +135,7 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
-bool server_queue::process_new_tasks(bool is_yielding) {
+bool server_queue::process_new_tasks(bool is_yielding, size_t * n_admitted) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         if (!running) {
@@ -149,6 +149,10 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         queue_tasks.pop_front();
         lock.unlock();
 
+        // note: read the type before the task is moved into the callback
+        const bool is_admission =
+            task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL;
+
         QUE_DBG("processing task, id = %d\n", task.id);
         if (!callback_new_task(std::move(task), is_yielding)) {
             // set it aside, do not put it back in the queue, else we offer it again in a loop
@@ -156,6 +160,9 @@ bool server_queue::process_new_tasks(bool is_yielding) {
             QUE_DBG("task declined, id = %d\n", task.id);
             lock.lock();
             queue_tasks_unhandled.push_back(std::move(task));
+        } else if (is_admission && n_admitted) {
+            // only count tasks the callback actually accepted
+            (*n_admitted)++;
         }
     }
 }
@@ -275,6 +282,27 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 }
 
+void server_queue::set_admission_coalesce(int64_t max_wait_us, size_t target_tasks) {
+    GGML_ASSERT(!running);
+    coalesce_max_wait_us = std::max<int64_t>(0, max_wait_us);
+    coalesce_current_wait_us = coalesce_max_wait_us;
+    coalesce_target_tasks = std::max<size_t>(2, target_tasks);
+}
+
+server_queue::coalesce_stats server_queue::get_coalesce_stats() const {
+    return {
+        coalesce_max_wait_us > 0,
+        coalesce_max_wait_us,
+        coalesce_current_wait_us.load(std::memory_order_relaxed),
+        coalesce_target_tasks,
+        coalesce_wait_cycles.load(std::memory_order_relaxed),
+        coalesce_wakeups.load(std::memory_order_relaxed),
+        coalesce_timeouts.load(std::memory_order_relaxed),
+        coalesce_wait_us.load(std::memory_order_relaxed),
+        coalesce_admitted_tasks.load(std::memory_order_relaxed),
+    };
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
@@ -298,7 +326,88 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
-        if (process_new_tasks(false)) {
+
+        // Admission coalescing. Drain the queue via process_new_tasks(), then - if a
+        // small batch is forming and there is still batch capacity - wait briefly for
+        // more completion tasks so they get admitted into the same decode. The wait
+        // grows when it pays off and shrinks on timeout, so an idle server pays ~nothing.
+        //
+        // note: upstream owns the drain loop now (process_new_tasks), so the coalescer
+        // wraps it rather than inlining its own dequeue.
+        size_t admission_tasks = 0;
+        int64_t coalesce_deadline_us = 0;
+        bool terminated = false;
+
+        while (true) {
+            const size_t admitted_before = admission_tasks;
+
+            if (process_new_tasks(false, &admission_tasks)) {
+                terminated = true;
+                break;
+            }
+
+            if (coalesce_deadline_us != 0 && admission_tasks > admitted_before) {
+                coalesce_admitted_tasks.fetch_add(admission_tasks - admitted_before, std::memory_order_relaxed);
+            }
+
+            if (coalesce_max_wait_us <= 0 || admission_tasks < 2 ||
+                    admission_tasks >= coalesce_target_tasks ||
+                    (callback_has_batch_capacity && !callback_has_batch_capacity())) {
+                break;
+            }
+
+            const int64_t now_us = ggml_time_us();
+            if (coalesce_deadline_us == 0) {
+                coalesce_deadline_us = now_us + coalesce_current_wait_us.load(std::memory_order_relaxed);
+                coalesce_admitted_tasks.fetch_add(admission_tasks, std::memory_order_relaxed);
+            }
+            const int64_t remaining_us = coalesce_deadline_us - now_us;
+            if (remaining_us <= 0) {
+                break;
+            }
+
+            bool woke = false;
+            {
+                std::unique_lock<std::mutex> lock(mutex_tasks);
+                if (!running) {
+                    terminated = true;
+                    break;
+                }
+                const int64_t wait_started_us = ggml_time_us();
+                // the predicate makes `woke` mean "queue non-empty or shutting down"
+                woke = condition_tasks.wait_for(
+                        lock,
+                        std::chrono::microseconds(remaining_us),
+                        [&] { return !queue_tasks.empty() || !running; });
+                const int64_t waited_us = ggml_time_us() - wait_started_us;
+                coalesce_wait_cycles.fetch_add(1, std::memory_order_relaxed);
+                coalesce_wait_us.fetch_add((uint64_t) waited_us, std::memory_order_relaxed);
+                if (!running) {
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if (woke) {
+                coalesce_wakeups.fetch_add(1, std::memory_order_relaxed);
+                const int64_t current = coalesce_current_wait_us.load(std::memory_order_relaxed);
+                coalesce_current_wait_us.store(std::min(
+                        coalesce_max_wait_us,
+                        current + std::max<int64_t>(1, coalesce_max_wait_us / 4)),
+                        std::memory_order_relaxed);
+                continue;
+            }
+
+            coalesce_timeouts.fetch_add(1, std::memory_order_relaxed);
+            const int64_t current = coalesce_current_wait_us.load(std::memory_order_relaxed);
+            coalesce_current_wait_us.store(std::max<int64_t>(
+                    std::min<int64_t>(250, coalesce_max_wait_us),
+                    current * 3 / 4),
+                    std::memory_order_relaxed);
+            break;
+        }
+
+        if (terminated) {
             break; // terminate
         }
 

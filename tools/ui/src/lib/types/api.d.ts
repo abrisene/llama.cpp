@@ -262,6 +262,16 @@ export interface ApiLlamaCppServerProps {
 	/** @deprecated Use {@link ui_settings} instead */
 	webui_settings?: Record<string, string | number | boolean>;
 	ui_settings?: Record<string, string | number | boolean>;
+	prefix_cache?: {
+		enabled?: boolean;
+		capture_mode?: 'always' | 'repeat' | 'explicit' | string;
+		admission_items?: number;
+		admission_capacity?: number;
+		recurrent_stride?: number;
+		deferred_items?: number;
+		deferred_bytes?: number;
+		[key: string]: unknown;
+	};
 	cors_proxy_enabled?: boolean;
 }
 
@@ -310,6 +320,20 @@ export interface ApiChatCompletionRequest {
 	// Continuation control (vLLM compat)
 	add_generation_prompt?: boolean;
 	continue_final_message?: boolean;
+	chat_template_kwargs?: Record<string, unknown>;
+	thinking_budget_tokens?: number;
+	reasoning_control?: boolean;
+}
+
+export interface ApiPrefixCacheResponse {
+	model: string;
+	tokens_evaluated: number;
+	boundary: number;
+	attention_blocks: number;
+	recurrent_sidecars: number;
+	bytes_published: number;
+	durable: boolean;
+	reason: string;
 }
 
 export interface ApiChatCompletionToolCallFunctionDelta {

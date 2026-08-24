@@ -114,6 +114,7 @@ struct server_context {
     void prefix_cache_mark_explicit_precache_request();
     void prefix_cache_mark_explicit_precache_success();
     void prefix_cache_mark_explicit_precache_failure();
+    json decode_arbiter_json() const;
 };
 
 

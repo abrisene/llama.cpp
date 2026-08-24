@@ -3703,6 +3703,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MEMORY_MARGIN"));
     add_opt(common_arg(
+        {"--models-decode-arbiter"},
+        {"--no-models-decode-arbiter"},
+        string_format("for router server, coordinate short generation decode leases across resident model processes (default: %s)",
+            params.models_decode_arbiter ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.models_decode_arbiter = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_DECODE_ARBITER"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),

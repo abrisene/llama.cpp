@@ -1,5 +1,17 @@
 <script lang="ts">
-	import { File, Folder, Image, MessageSquare, Mic, Plus, Video } from '@lucide/svelte';
+	import {
+		Check,
+		Database,
+		File,
+		Folder,
+		Image,
+		LoaderCircle,
+		MessageSquare,
+		Mic,
+		Plus,
+		TriangleAlert,
+		Video
+	} from '@lucide/svelte';
 	import { ChatFormActionAddToolsSubmenu } from '$lib/components/app';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
@@ -15,6 +27,8 @@
 	import { getChatFormActionsContext } from '$lib/contexts';
 	import { AttachmentAction, AttachmentItemEnabledWhen } from '$lib/enums';
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
+	import { serverStore } from '$lib/stores';
+	import { onDestroy } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -25,9 +39,38 @@
 	const chatFormActions = getChatFormActionsContext();
 
 	let dropdownOpen = $state(false);
+	let precacheState = $state<'idle' | 'working' | 'complete' | 'failed'>('idle');
+	let precacheResetTimer: ReturnType<typeof setTimeout> | undefined;
 	// The system message action moves focus to the message editor, so the menu
 	// must not restore focus to the trigger on close
 	let suppressCloseAutoFocus = false;
+
+	function queuePrecacheStateReset() {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheResetTimer = setTimeout(() => {
+			precacheState = 'idle';
+		}, 2400);
+	}
+
+	async function handlePrecachePrefixClick() {
+		const precache = chatFormActions.onPrecachePrefix;
+
+		if (!precache || chatFormActions.precachePrefixDisabled || precacheState === 'working') return;
+
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheState = 'working';
+
+		try {
+			await precache();
+			precacheState = 'complete';
+		} catch {
+			precacheState = 'failed';
+		} finally {
+			queuePrecacheStateReset();
+		}
+	}
 
 	const attachmentMenu = useAttachmentMenu(
 		() => ({
@@ -64,6 +107,10 @@
 			.map((item) => FILE_MODALITY_ICONS[item.enabledWhen ?? ''])
 			.filter((modality) => modality !== undefined)
 	);
+
+	onDestroy(() => {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+	});
 </script>
 
 <div class="flex items-center gap-1 {className}">
@@ -155,6 +202,31 @@
 					<Folder class={ICON_CLASS_DEFAULT} />
 
 					<span class="truncate">{chatFormActions.workingDirectoryLabel}</span>
+				</DropdownMenu.Item>
+			{/if}
+
+			{#if chatFormActions.showPrecachePrefix && chatFormActions.onPrecachePrefix}
+				<DropdownMenu.Item
+					class="flex cursor-pointer items-center gap-2"
+					disabled={chatFormActions.precachePrefixDisabled || precacheState === 'working'}
+					onclick={(event) => {
+						event.preventDefault();
+						void handlePrecachePrefixClick();
+					}}
+				>
+					{#if precacheState === 'working'}
+						<LoaderCircle class="{ICON_CLASS_DEFAULT} animate-spin" />
+						<span>Caching prefix</span>
+					{:else if precacheState === 'complete'}
+						<Check class={ICON_CLASS_DEFAULT} />
+						<span>Prefix cached</span>
+					{:else if precacheState === 'failed'}
+						<TriangleAlert class={ICON_CLASS_DEFAULT} />
+						<span>Precache failed</span>
+					{:else}
+						<Database class={ICON_CLASS_DEFAULT} />
+						<span>Precache prefix</span>
+					{/if}
 				</DropdownMenu.Item>
 			{/if}
 

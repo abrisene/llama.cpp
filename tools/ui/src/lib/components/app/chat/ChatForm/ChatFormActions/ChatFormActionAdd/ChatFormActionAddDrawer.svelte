@@ -1,13 +1,17 @@
 <script lang="ts">
 	import {
+		Check,
 		ChevronDown,
 		ChevronRight,
+		Database,
 		File,
 		Folder,
 		Image,
+		LoaderCircle,
 		MessageSquare,
 		Mic,
 		PencilRuler,
+		TriangleAlert,
 		Video
 	} from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -25,7 +29,7 @@
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
 	import { useToolsPanel } from '$lib/hooks/use-tools-panel.svelte';
 	import type { ToolGroup } from '$lib/types';
-	import type { Snippet } from 'svelte';
+	import { onDestroy, type Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -38,6 +42,8 @@
 
 	let drawerOpen = $state(false);
 	let toolsExpanded = $state(false);
+	let precacheState = $state<'idle' | 'working' | 'complete' | 'failed'>('idle');
+	let precacheResetTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const attachmentMenu = useAttachmentMenu(
 		() => ({
@@ -82,6 +88,37 @@
 
 	const itemRowClass =
 		'flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-accent';
+
+	function queuePrecacheStateReset() {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheResetTimer = setTimeout(() => {
+			precacheState = 'idle';
+		}, 2400);
+	}
+
+	async function handlePrecachePrefixClick() {
+		const precache = chatFormActions.onPrecachePrefix;
+
+		if (!precache || chatFormActions.precachePrefixDisabled || precacheState === 'working') return;
+
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+
+		precacheState = 'working';
+
+		try {
+			await precache();
+			precacheState = 'complete';
+		} catch {
+			precacheState = 'failed';
+		} finally {
+			queuePrecacheStateReset();
+		}
+	}
+
+	onDestroy(() => {
+		if (precacheResetTimer) clearTimeout(precacheResetTimer);
+	});
 </script>
 
 <div class="flex items-center gap-1 {className}">
@@ -148,6 +185,29 @@
 						<Folder class="{ICON_CLASS_DEFAULT} shrink-0" />
 
 						<span class="truncate">{chatFormActions.workingDirectoryLabel}</span>
+					</button>
+				{/if}
+
+				{#if chatFormActions.showPrecachePrefix && chatFormActions.onPrecachePrefix}
+					<button
+						class={itemClass}
+						disabled={chatFormActions.precachePrefixDisabled || precacheState === 'working'}
+						onclick={handlePrecachePrefixClick}
+						type="button"
+					>
+						{#if precacheState === 'working'}
+							<LoaderCircle class="{ICON_CLASS_DEFAULT} shrink-0 animate-spin" />
+							<span>Caching prefix</span>
+						{:else if precacheState === 'complete'}
+							<Check class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Prefix cached</span>
+						{:else if precacheState === 'failed'}
+							<TriangleAlert class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache failed</span>
+						{:else}
+							<Database class="{ICON_CLASS_DEFAULT} shrink-0" />
+							<span>Precache prefix</span>
+						{/if}
 					</button>
 				{/if}
 

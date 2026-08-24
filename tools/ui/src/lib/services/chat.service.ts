@@ -38,6 +38,7 @@ import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
 	ApiChatMessageData,
+	ApiPrefixCacheResponse,
 	ApiStreamSession
 } from '$lib/types/api';
 import type { OpenAIToolDefinition } from '$lib/types/mcp';
@@ -913,6 +914,36 @@ export class ChatService {
 		return null;
 	}
 
+	/**
+	 * Explicitly precaches the given messages as a persistent prefix, using the
+	 * dedicated /cache/prefix route rather than a fire-and-forget completions
+	 * request. Unlike preEncode, this awaits and returns the server's response
+	 * so the caller can surface cache status to the user.
+	 */
+	static async precachePrefix(
+		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		options: SettingsChatServiceOptions = {},
+		signal?: AbortSignal
+	): Promise<ApiPrefixCacheResponse> {
+		const requestBody = await ChatService.buildChatCompletionRequest(messages, {
+			...options,
+			stream: false
+		});
+
+		const response = await fetch(API_CHAT.PREFIX_CACHE, {
+			body: JSON.stringify(requestBody),
+			headers: getJsonHeaders(),
+			method: 'POST',
+			signal
+		});
+
+		if (!response.ok) {
+			throw await ChatService.parseErrorResponse(response);
+		}
+
+		return (await response.json()) as ApiPrefixCacheResponse;
+	}
+
 	// probe the resume route status without consuming the stream: the SSE route has no HEAD,
 	// so issue the GET and abort it right after the status line. 0 on network error
 	static async probeResumeStatus(streamId: string): Promise<number> {
@@ -1041,21 +1072,14 @@ export class ChatService {
 	}
 
 	/**
-	 * Sends a chat completion request to the llama-server.
-	 * Supports both streaming and non-streaming responses with comprehensive parameter configuration.
-	 * Automatically converts database messages with attachments to the appropriate API format.
-	 *
-	 * @param messages - Array of chat messages to send to the API (supports both ApiChatMessageData and DatabaseMessage with attachments)
-	 * @param options - Configuration options for the chat completion request. See `SettingsChatServiceOptions` type for details.
-	 * @returns {Promise<string | void>} that resolves to the complete response string (non-streaming) or void (streaming)
-	 * @throws {Error} if the request fails or is aborted
+	 * Builds the chat completion request body from messages and settings. Shared by
+	 * sendMessage and precachePrefix so an explicit precache hashes exactly the prompt
+	 * the next real request will send.
 	 */
-	static async sendMessage(
+	static async buildChatCompletionRequest(
 		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
-		options: SettingsChatServiceOptions = {},
-		conversationId?: string,
-		signal?: AbortSignal
-	): Promise<string | void> {
+		options: SettingsChatServiceOptions = {}
+	): Promise<ApiChatCompletionRequest> {
 		const {
 			backend_sampling,
 			continueFinalMessage,
@@ -1074,15 +1098,6 @@ export class ChatService {
 			frequency_penalty,
 			max_tokens,
 			min_p,
-			onChunk,
-			onComplete,
-			onCompletionId,
-			onConnectionState,
-			onError,
-			onModel,
-			onReasoningChunk,
-			onTimings,
-			onToolCallChunk,
 			presence_penalty,
 			reasoningEffort,
 			// Penalty parameters
@@ -1249,6 +1264,39 @@ export class ChatService {
 				console.warn('Failed to parse custom parameters:', error);
 			}
 		}
+
+		return requestBody;
+	}
+
+	/**
+	 * Sends a chat completion request to the llama-server.
+	 * Supports both streaming and non-streaming responses with comprehensive parameter configuration.
+	 * Automatically converts database messages with attachments to the appropriate API format.
+	 *
+	 * @param messages - Array of chat messages to send to the API (supports both ApiChatMessageData and DatabaseMessage with attachments)
+	 * @param options - Configuration options for the chat completion request. See `SettingsChatServiceOptions` type for details.
+	 * @returns {Promise<string | void>} that resolves to the complete response string (non-streaming) or void (streaming)
+	 * @throws {Error} if the request fails or is aborted
+	 */
+	static async sendMessage(
+		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		options: SettingsChatServiceOptions = {},
+		conversationId?: string,
+		signal?: AbortSignal
+	): Promise<string | void> {
+		const {
+			onChunk,
+			onComplete,
+			onCompletionId,
+			onConnectionState,
+			onError,
+			onModel,
+			onReasoningChunk,
+			onTimings,
+			onToolCallChunk,
+			stream
+		} = options;
+		const requestBody = await ChatService.buildChatCompletionRequest(messages, options);
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };

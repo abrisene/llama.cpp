@@ -156,6 +156,33 @@
 		return true;
 	}
 
+	async function handlePrecachePrefix(
+		message: string,
+		files?: ChatUploadedFile[]
+	): Promise<boolean> {
+		const plainFiles = files ? $state.snapshot(files) : undefined;
+		const result = plainFiles
+			? await parseFilesToMessageExtras(plainFiles, activeModel.activeModelId ?? undefined)
+			: undefined;
+
+		if (result?.emptyFiles && result.emptyFiles.length > 0) {
+			emptyFileNames = result.emptyFiles;
+			showEmptyFileDialog = true;
+
+			return false;
+		}
+
+		try {
+			await chatStore.precachePrefix(message, result?.extras);
+
+			return true;
+		} catch (error) {
+			console.error('Failed to precache prefix:', error);
+
+			return false;
+		}
+	}
+
 	let lastScrolledConversationId: string | null = null;
 
 	// Every navigation lands anew: this screen outlives its routes, so coming
@@ -384,6 +411,7 @@
 				isLoading={isCurrentConversationLoading}
 				onFileRemove={fileUpload.handleFileRemove}
 				onFileUpload={fileUpload.handleFileUpload}
+				onPrecachePrefix={handlePrecachePrefix}
 				onSend={handleSendMessage}
 				onStop={() => chatStore.stopGeneration()}
 				onSystemPromptAdd={handleSystemPromptAdd}

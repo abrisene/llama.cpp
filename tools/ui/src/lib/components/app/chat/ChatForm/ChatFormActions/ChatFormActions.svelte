@@ -15,7 +15,7 @@
 	import { useChatFormModel } from '$lib/hooks/use-chat-form-model.svelte';
 	import { useShowContextGauge } from '$lib/hooks/use-context-gauge.svelte';
 	import { ChatService } from '$lib/services';
-	import { conversationsStore, deviceStore, settingsStore, toolsStore } from '$lib/stores';
+	import { chatStore, conversationsStore, deviceStore, modelsStore, serverStore, settingsStore, toolsStore } from '$lib/stores';
 	import { abbreviateWorkingDir, getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -24,6 +24,7 @@
 		disabled?: boolean;
 		/** Lay the actions out in the row around them, the add button first, the rest last. */
 		inline?: boolean;
+		activeModelId?: string | null;
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
@@ -39,6 +40,7 @@
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
 		onWorkingDirectoryClick?: () => void;
+		onPrecachePrefix?: () => Promise<void>;
 	}
 
 	let {
@@ -46,12 +48,14 @@
 		class: className = '',
 		disabled = false,
 		inline = false,
+		activeModelId = null,
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
 		micWarning = null,
 		onFileUpload,
 		onMicClick,
+		onPrecachePrefix,
 		onStop,
 		onSystemPromptClick,
 		onWorkingDirectoryClick,
@@ -84,6 +88,20 @@
 	let shouldShowRecordButton = $derived(
 		hasAudioModality && !canSend && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
+	let selectedModelProps = $derived.by(() => {
+		if (!serverStore.isRouterMode) return serverStore.props;
+
+		if (!activeModelId) return null;
+
+		const cached = modelsStore.props.getModelProps(activeModelId);
+
+		if (!cached) {
+			void modelsStore.props.fetchModelProps(activeModelId);
+		}
+
+		return cached;
+	});
+	let showPrecachePrefix = $derived(selectedModelProps?.prefix_cache?.enabled === true);
 
 	let selectorModelRef: ModelsSelector | undefined = $state(undefined);
 
@@ -124,6 +142,15 @@
 			return workingDirectory
 				? abbreviateWorkingDir(workingDirectory, toolsStore.serverHome)
 				: SET_WORKING_DIRECTORY_LABEL;
+		},
+		get onPrecachePrefix() {
+			return onPrecachePrefix;
+		},
+		get precachePrefixDisabled() {
+			return isLoading || disabled;
+		},
+		get showPrecachePrefix() {
+			return showPrecachePrefix;
 		}
 	});
 </script>

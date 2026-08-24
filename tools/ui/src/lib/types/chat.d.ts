@@ -354,10 +354,13 @@ export interface ChatFormActionsContext {
 	readonly hasAudioModality: boolean;
 	readonly hasVideoModality: boolean;
 	readonly hasVisionModality: boolean;
+	readonly showPrecachePrefix: boolean;
+	readonly precachePrefixDisabled: boolean;
 	onFileUpload?: () => void;
 	onSystemPromptClick?: () => void;
 	/** Opens the working directory picker; set where the + menu offers it. */
 	onWorkingDirectoryClick?: () => void;
 	/** The working directory's name in the + menu, or what sets one. */
 	readonly workingDirectoryLabel: string;
+	onPrecachePrefix?: () => Promise<void>;
 }

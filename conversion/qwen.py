@@ -559,6 +559,31 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
+    @staticmethod
+    def _lora_reorder_last_dim(lora, num_k_heads, num_v_per_k, head_dim):
+        # W = B @ A with W shape [..., out, in]. Reordering W's last dim (in) commutes
+        # with a rank-preserving column reorder on A alone; B stays untouched.
+        A, B = lora.get_lora_A_B()
+        A_new = _LinearAttentionVReorderBase._reorder_v_heads(A, -1, num_k_heads, num_v_per_k, head_dim)
+        return type(lora)(A_new, B)
+
+    @staticmethod
+    def _lora_reorder_rows(lora, num_k_heads, num_v_per_k, head_dim):
+        # Reordering W's row (output) dim commutes with a row reorder on B alone;
+        # A (rank × in) stays untouched. B's row dim is dim=-2.
+        A, B = lora.get_lora_A_B()
+        B_new = _LinearAttentionVReorderBase._reorder_v_heads(B, -2, num_k_heads, num_v_per_k, head_dim)
+        return type(lora)(A, B_new)
+
+    @staticmethod
+    def _lora_reorder_row_slice(lora, row_start, num_k_heads, num_v_per_k, head_dim):
+        # Reorder only rows [row_start:] of W by splicing B; A untouched.
+        A, B = lora.get_lora_A_B()
+        head = B[:row_start]
+        tail = _LinearAttentionVReorderBase._reorder_v_heads(B[row_start:], -2, num_k_heads, num_v_per_k, head_dim)
+        B_new = torch.cat([head, tail], dim=-2)
+        return type(lora)(A, B_new)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
@@ -567,27 +592,49 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             head_k_dim = self.hparams["linear_key_head_dim"]
             head_v_dim = self.hparams["linear_value_head_dim"]
             num_v_per_k = num_v_heads // num_k_heads
+            # LoRA-aware dispatch: the plain reshape-based reorder can't operate on
+            # a rank-decomposed LoraTorchTensor (its .reshape() refuses to change the
+            # row size). Duck-type via .get_lora_A_B() and use the rank-preserving
+            # helpers above, which move the reorder onto A or B (whichever the
+            # reorder's dim maps to under W = B @ A).
+            is_lora = hasattr(data_torch, "get_lora_A_B")
 
             if ".in_proj_qkv." in name:
                 # QKV weight: reorder only the V rows
                 q_dim = head_k_dim * num_k_heads
                 k_dim = head_k_dim * num_k_heads
-                q = data_torch[:q_dim]
-                k = data_torch[q_dim:q_dim + k_dim]
-                v = data_torch[q_dim + k_dim:]
-                v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
-                data_torch = torch.cat([q, k, v], dim=0)
+                if is_lora:
+                    data_torch = self._lora_reorder_row_slice(
+                        data_torch, q_dim + k_dim, num_k_heads, num_v_per_k, head_v_dim
+                    )
+                else:
+                    q = data_torch[:q_dim]
+                    k = data_torch[q_dim:q_dim + k_dim]
+                    v = data_torch[q_dim + k_dim:]
+                    v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([q, k, v], dim=0)
 
             elif ".in_proj_z." in name:
                 # Z gate weight: reorder rows (num_v_heads * head_v_dim)
-                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
+                if is_lora:
+                    data_torch = self._lora_reorder_rows(data_torch, num_k_heads, num_v_per_k, head_v_dim)
+                else:
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
 
             elif ".in_proj_b." in name or ".in_proj_a." in name:
                 # Beta/Alpha weight: reorder rows (num_v_heads, head_dim=1)
-                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
+                if is_lora:
+                    data_torch = self._lora_reorder_rows(data_torch, num_k_heads, num_v_per_k, 1)
+                else:
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
 
             elif ".A_log" in name or ".dt_bias" in name or ".dt_proj" in name:
-                # A_log / dt_bias: 1D parameters with num_v_heads elements
+                # A_log / dt_bias: 1D parameters with num_v_heads elements.
+                # LoRA on these bias-like parameters is atypical; refuse loudly.
+                if is_lora:
+                    raise NotImplementedError(
+                        f"LoRA reorder for {name} is not supported (1D bias-like linear_attn parameter)"
+                    )
                 if data_torch.ndim == 1:
                     data_torch = self._reorder_v_heads(
                         data_torch.unsqueeze(-1), 0, num_k_heads, num_v_per_k, 1
@@ -596,17 +643,27 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                     data_torch = self._reorder_v_heads(data_torch, -1, num_k_heads, num_v_per_k, 1)
 
             elif ".conv1d" in name:
-                # Conv1d kernel: reorder only the V channel portion
-                data = data_torch.squeeze()
-                qk_channels = head_k_dim * num_k_heads * 2
-                qk_part = data[:qk_channels]
-                v_part = data[qk_channels:]
-                v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
-                data_torch = torch.cat([qk_part, v_part], dim=0)
+                # Conv1d kernel: reorder only the V channel portion. LoRA case uses
+                # the same row-slice pattern as in_proj_qkv (QK channels first, then V).
+                if is_lora:
+                    qk_channels = head_k_dim * num_k_heads * 2
+                    data_torch = self._lora_reorder_row_slice(
+                        data_torch, qk_channels, num_k_heads, num_v_per_k, head_v_dim
+                    )
+                else:
+                    data = data_torch.squeeze()
+                    qk_channels = head_k_dim * num_k_heads * 2
+                    qk_part = data[:qk_channels]
+                    v_part = data[qk_channels:]
+                    v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
                 # Out projection weight: reorder columns (input dimension)
-                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+                if is_lora:
+                    data_torch = self._lora_reorder_last_dim(data_torch, num_k_heads, num_v_per_k, head_v_dim)
+                else:
+                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
         yield from super().modify_tensors(data_torch, name, bid)
 

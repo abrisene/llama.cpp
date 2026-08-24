@@ -88,6 +88,16 @@ correct throughput setting for this machine is therefore the bypass mode.
 
 Goal: improve combined t/s when several slots on one model are generating.
 
+Implementation status: implemented behind `--batch-coalesce-us`. The coalescer
+acts only at admission when at least two generation requests were already
+received in one queue cycle and free batch slots remain. It never sleeps
+between generated tokens, does not delay an isolated request, and does not wait
+after a burst already fills every configured server slot.
+
+Production remains at the default value of `0` until the deferred benchmark
+matrix qualifies a workload where partial request bursts benefit from the
+window.
+
 Required behavior:
 
 - use the existing continuous-batching path;
@@ -100,6 +110,17 @@ Required behavior:
 
 The coalescer and cross-model scheduler must share one latency budget. Their
 waits must not stack independently.
+
+The current window grows toward the configured maximum when another task
+arrives during the wait. It shrinks after a timeout, because that timeout added
+first-token latency without increasing batch width. When the cross-model decode
+arbiter is enabled, admission coalescing is disabled so the two waits cannot
+stack.
+
+Child `/props` exposes the maximum and current window, waits, wakeups, timeouts,
+admitted tasks, decode calls, total and maximum batch tokens, average tokens and
+generation slots per decode, and full decode-step wall time including
+post-decode sampling.
 
 ## Verification order
 

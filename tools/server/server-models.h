@@ -87,6 +87,7 @@ struct server_model_meta {
     bool hidden = false; // hidden from GET /models, but still accept if requested
     json architecture = server_model_architecture_json(false, false, false, {"text"});
     uint32_t n_ctx_train = 0; // trained context, read from the GGUF metadata; 0 when unknown
+    std::string arch; // general.architecture, lazily populated by server_models::resolve_model_arch()
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -106,6 +107,16 @@ struct server_model_meta {
 
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
     void update_caps(const common_params & base);
+};
+
+// router-side dynamic LoRA registry entry (Stage 2): tracks a path-form adapter that clients
+// registered via POST /router/loras, plus which currently-loaded children it has been pushed to
+struct server_router_lora_entry {
+    std::string path; // canonical
+    std::string arch; // general.architecture read from the adapter GGUF
+    float scale = 1.0f;
+    std::string alias;
+    std::set<std::string> applied_to; // model names it was successfully forwarded to
 };
 
 struct server_models_routes;
@@ -230,6 +241,18 @@ private:
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
+    // router-side dynamic LoRA registry (Stage 2), keyed by canonical adapter path.
+    // separate mutex: mutations here don't need to interact with the instance mapping lock,
+    // and forwarding to children does blocking HTTP I/O that must not be done under `mutex`
+    std::mutex lora_registry_mu;
+    std::map<std::string, server_router_lora_entry> lora_registry;
+
+    // union of lora-roots across all configured presets plus any router-level --lora-root
+    std::vector<std::string> collect_lora_roots();
+
+    // return the cached general.architecture for a model, resolving and caching it (by peeking
+    // the model's own GGUF header) on first call
+    std::string resolve_model_arch(const std::string & name);
 public:
     // conv_id -> model tracker for the resumable stream routes, owns its lock
     conv_model_tracker conv_models;
@@ -311,6 +334,16 @@ public:
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
+    // router-side dynamic LoRA registry (Stage 2, thread-safe, no persistence):
+    // add/update entries and forward to every currently-loaded child whose arch matches
+    json router_loras_add(const json & body);
+    // list the registry, applied_to filtered down to children currently ready
+    json router_loras_list();
+    // remove entries (by path, or all) and ask arch-matching loaded children to zero the scale
+    json router_loras_remove(const json & body);
+    // forward registry entries matching this child's arch, called once it reports ready
+    void router_loras_replay(const std::string & name);
+
 private:
     // one thread watching every child; keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
@@ -375,6 +408,15 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+
+    // dedicated /lora-adapters POST route: unlike the generic proxy_post, the model name comes
+    // from ?model= (the child's endpoint takes a bare JSON array body, not {"model": ...})
+    server_http_context::handler_t lora_adapters_post;
+
+    // router-native dynamic LoRA registry (Stage 2)
+    server_http_context::handler_t get_router_loras;
+    server_http_context::handler_t post_router_loras;
+    server_http_context::handler_t del_router_loras;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

@@ -233,13 +233,15 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 #endif
 
     add((new field_json("lora"))
-        ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
+        ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields, "
+                    "or `path` (and optional `alias`) and `scale` to dynamically load an adapter not yet loaded. "
+                    "Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             const auto & lora = data.at("lora");
             if (!lora.is_array()) {
                 throw std::runtime_error("Error: 'lora' must be an array of objects with 'id' and 'scale' fields");
             }
-            ctx.params.lora = parse_lora_request(lora);
+            ctx.params.lora = parse_lora_request(lora, &ctx.params.lora_refs);
         }));
 
     // sequence breakers for DRY

@@ -881,6 +881,10 @@ private:
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
+    // owns lora adapters loaded dynamically at runtime (via SERVER_TASK_TYPE_LOAD_LORA);
+    // raw pointers are also referenced from params_base.lora_adapters
+    std::vector<llama_adapter_lora_ptr> dynamic_loras;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -1014,6 +1018,24 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        // default lora_roots to the parent directories of any pre-configured lora adapters,
+        // so existing users get dynamic-load addressability for their own adapters for free
+        if (params_base.lora_roots.empty()) {
+            std::vector<std::string> derived_roots;
+            for (const auto & la : params_base.lora_adapters) {
+                std::error_code ec;
+                auto parent = std::filesystem::weakly_canonical(std::filesystem::path(la.path), ec).parent_path();
+                if (ec) {
+                    continue;
+                }
+                std::string parent_str = parent.string();
+                if (std::find(derived_roots.begin(), derived_roots.end(), parent_str) == derived_roots.end()) {
+                    derived_roots.push_back(parent_str);
+                }
+            }
+            params_base.lora_roots = derived_roots;
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1691,6 +1713,96 @@ private:
         return res;
     }
 
+    // resolves and loads {path, scale} pairs as new (or existing) lora adapters, appending
+    // newly loaded ones to params_base.lora_adapters. Returns one id per entry in `paths`,
+    // in order. On any failure, sets `err` and returns a partial (possibly empty) result --
+    // callers must check `err` and treat the whole batch as failed.
+    std::vector<int> load_lora_paths(
+            const std::vector<std::pair<std::string, float>> & paths,
+            const std::vector<std::string> & aliases,
+            std::string & err) {
+        std::vector<int> new_ids;
+
+        for (size_t i = 0; i < paths.size(); ++i) {
+            const std::string & req_path = paths[i].first;
+            const float scale = paths[i].second;
+
+            std::string safe_path = lora_resolve_safe_path(req_path, params_base.lora_roots);
+            if (safe_path.empty()) {
+                // fail-closed exception: with no configured roots (or path outside all roots),
+                // still allow addressing an adapter that is already pre-loaded
+                std::error_code ec;
+                std::string canon = std::filesystem::weakly_canonical(std::filesystem::path(req_path), ec).string();
+                if (!ec) {
+                    for (const auto & la : params_base.lora_adapters) {
+                        std::error_code ec2;
+                        std::string la_canon = std::filesystem::weakly_canonical(std::filesystem::path(la.path), ec2).string();
+                        if (!ec2 && la_canon == canon) {
+                            safe_path = canon;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (safe_path.empty()) {
+                err = string_format("lora path rejected (outside lora-root and not already loaded): %s", req_path.c_str());
+                return new_ids;
+            }
+
+            // already loaded?
+            int existing_id = -1;
+            for (size_t j = 0; j < params_base.lora_adapters.size(); ++j) {
+                if (params_base.lora_adapters[j].path == safe_path) {
+                    existing_id = (int) j;
+                    break;
+                }
+            }
+            if (existing_id >= 0) {
+                params_base.lora_adapters[existing_id].scale = scale;
+                new_ids.push_back(existing_id);
+                continue;
+            }
+
+            llama_adapter_lora * ptr = llama_adapter_lora_init(model_tgt, safe_path.c_str());
+            if (ptr == nullptr) {
+                err = string_format("failed to load lora adapter: %s", safe_path.c_str());
+                return new_ids;
+            }
+
+            char buf_arch_lora[1024];
+            char buf_arch_model[1024];
+            llama_adapter_meta_val_str(ptr, "general.architecture", buf_arch_lora, sizeof(buf_arch_lora));
+            llama_model_meta_val_str(model_tgt, "general.architecture", buf_arch_model, sizeof(buf_arch_model));
+            if (std::string(buf_arch_lora) != std::string(buf_arch_model)) {
+                err = string_format("lora adapter architecture mismatch (adapter='%s', model='%s'): %s",
+                        buf_arch_lora, buf_arch_model, safe_path.c_str());
+                llama_adapter_lora_free(ptr);
+                return new_ids;
+            }
+
+            dynamic_loras.emplace_back(ptr);
+
+            common_adapter_lora_info info;
+            info.path  = safe_path;
+            info.scale = scale;
+            info.ptr   = ptr;
+
+            char buf[1024];
+            llama_adapter_meta_val_str(ptr, "adapter.lora.task_name", buf, sizeof(buf));
+            info.task_name = buf;
+            llama_adapter_meta_val_str(ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+            info.prompt_prefix = buf;
+
+            // alias handling (router-side arch-match propagation) is stage 2 -- not applied here
+            (void) (i < aliases.size() ? aliases[i] : std::string());
+
+            params_base.lora_adapters.push_back(info);
+            new_ids.push_back((int) params_base.lora_adapters.size() - 1);
+        }
+
+        return new_ids;
+    }
+
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
@@ -1705,6 +1817,27 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // resolve path-based lora refs (dynamic loading) to ids before building the lora list;
+        // this runs synchronously on the main scheduler thread, same as SERVER_TASK_TYPE_LOAD_LORA
+        if (!task.params.lora_refs.empty()) {
+            std::vector<std::pair<std::string, float>> load_paths;
+            std::vector<std::string> load_aliases;
+            for (const auto & ref : task.params.lora_refs) {
+                load_paths.emplace_back(ref.path, ref.scale);
+                load_aliases.push_back(ref.alias);
+            }
+
+            std::string err;
+            std::vector<int> new_ids = load_lora_paths(load_paths, load_aliases, err);
+            if (!err.empty()) {
+                send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            for (size_t i = 0; i < new_ids.size(); ++i) {
+                task.params.lora[new_ids[i]] = task.params.lora_refs[i].scale;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2720,6 +2853,31 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_LOAD_LORA:
+                {
+                    std::string err;
+                    std::vector<int> new_ids = load_lora_paths(task.load_lora, task.load_lora_aliases, err);
+                    if (!err.empty()) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // merge freshly-loaded adapters into the requested id->scale map, then apply
+                    // full SET_LORA semantics (zero out any pre-existing adapter not listed here)
+                    // so a single dispatched task covers both load and scale-set in the endpoint
+                    std::map<int, float> scales = task.set_lora;
+                    for (size_t i = 0; i < new_ids.size() && i < task.load_lora.size(); ++i) {
+                        scales[new_ids[i]] = task.load_lora[i].second;
+                    }
+                    auto new_loras = construct_lora_list(scales);
+                    for (size_t i = 0; i < new_loras.size(); ++i) {
+                        SRV_TRC("set lora adapter idx=%zu scale=%f\n", i, new_loras[i].scale);
+                    }
+                    params_base.lora_adapters = new_loras;
+                    auto res = std::make_unique<server_task_result_load_lora>();
+                    res->id = task.id;
+                    res->new_ids = std::move(new_ids);
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5261,14 +5419,29 @@ void server_routes::init_routes() {
         }
 
         auto & rd = res->rd;
+
+        // parse the body: id-form entries become set_lora scales, path-form entries become
+        // load requests (LOAD_LORA handler resolves them, appends to lora_adapters, then
+        // applies the merged scale map with SET_LORA semantics)
+        std::vector<request_lora_ref> refs;
+        std::map<int, float> id_scale = parse_lora_request(body, &refs);
+
+        std::vector<std::pair<std::string, float>> load_paths;
+        std::vector<std::string> load_aliases;
+        for (const auto & ref : refs) {
+            load_paths.emplace_back(ref.path, ref.scale);
+            load_aliases.push_back(ref.alias);
+        }
+
         {
-            server_task task(SERVER_TASK_TYPE_SET_LORA);
+            server_task task(SERVER_TASK_TYPE_LOAD_LORA);
             task.id = rd.get_new_id();
-            task.set_lora = parse_lora_request(body);
+            task.load_lora = std::move(load_paths);
+            task.load_lora_aliases = std::move(load_aliases);
+            task.set_lora = std::move(id_scale);
             rd.post_task(std::move(task));
         }
 
-        // get the result
         auto result = rd.next(req.should_stop);
         if (!result) {
             // connection was closed
@@ -5281,7 +5454,7 @@ void server_routes::init_routes() {
             return res;
         }
 
-        GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        GGML_ASSERT(dynamic_cast<server_task_result_load_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };

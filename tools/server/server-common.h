@@ -118,7 +118,29 @@ bool lora_should_clear_cache(
         const std::vector<common_adapter_lora_info> & current,
         const std::vector<common_adapter_lora_info> & next);
 
-std::map<int, float> parse_lora_request(const json & data);
+// a "lora" request entry that refers to an adapter by path instead of by id
+// (id is not known until the adapter is dynamically loaded, see lora_resolve_safe_path)
+struct request_lora_ref {
+    std::string path;
+    std::string alias;
+    float scale = 0.0f;
+};
+
+// parses a "lora" request array (POST /completion "lora" field or POST /lora-adapters body).
+// entries with "id" are collected into the returned id->scale map.
+// entries with "path" (and no "id") are collected into `*refs`, if provided, for later
+// resolution by dynamic loading; if `refs` is null, such entries are ignored.
+std::map<int, float> parse_lora_request(const json & data, std::vector<request_lora_ref> * refs = nullptr);
+
+// resolves `path` to a canonical absolute path if it (after canonicalization) is a regular
+// file located under one of `roots` (also canonicalized). Returns "" on failure: path does
+// not exist, is not a regular file, or is not under any of `roots`.
+// uses std::filesystem::weakly_canonical to resolve symlinks and ".." components, which
+// defeats symlink-escape attempts against the configured roots.
+// note: this does not implement the "allow already pre-loaded adapters when roots is empty"
+// fallback described for lora-root-less setups -- callers that need that behavior must check
+// params_base.lora_adapters themselves (see server-context.cpp load_lora_paths).
+std::string lora_resolve_safe_path(const std::string & path, const std::vector<std::string> & roots);
 
 bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,

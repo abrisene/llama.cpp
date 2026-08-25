@@ -32,6 +32,7 @@
 #include <poll.h>
 #include <unistd.h>
 #endif
+#include <filesystem>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -174,17 +175,61 @@ bool lora_should_clear_cache(
         !lora_all_alora(next));
 }
 
-std::map<int, float> parse_lora_request(const json & data) {
+std::map<int, float> parse_lora_request(const json & data, std::vector<request_lora_ref> * refs) {
     std::map<int, float> lora;
 
     // set value
     for (const auto & entry : data) {
-        int id      = json_value(entry, "id", -1);
         float scale = json_value(entry, "scale", 0.0f);
+        if (entry.contains("path")) {
+            if (refs != nullptr) {
+                request_lora_ref ref;
+                ref.path  = entry.at("path").get<std::string>();
+                ref.alias = json_value(entry, "alias", std::string());
+                ref.scale = scale;
+                refs->push_back(std::move(ref));
+            }
+            continue;
+        }
+        int id = json_value(entry, "id", -1);
         lora[id] = scale;
     }
 
     return lora;
+}
+
+std::string lora_resolve_safe_path(const std::string & path, const std::vector<std::string> & roots) {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    fs::path canon = fs::weakly_canonical(fs::path(path), ec);
+    if (ec) {
+        return "";
+    }
+    if (!fs::is_regular_file(canon, ec) || ec) {
+        return "";
+    }
+
+    for (const auto & root : roots) {
+        std::error_code root_ec;
+        fs::path root_canon = fs::weakly_canonical(fs::path(root), root_ec);
+        if (root_ec) {
+            continue;
+        }
+
+        std::error_code rel_ec;
+        fs::path rel = fs::relative(canon, root_canon, rel_ec);
+        if (rel_ec) {
+            continue;
+        }
+        // relative() prefixes with ".." when `canon` escapes `root_canon`
+        const std::string rel_str = rel.generic_string();
+        if (rel_str != ".." && rel_str.compare(0, 3, "../") != 0) {
+            return canon.string();
+        }
+    }
+
+    return "";
 }
 
 bool are_lora_equal(

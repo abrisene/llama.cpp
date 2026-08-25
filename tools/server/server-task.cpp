@@ -1685,6 +1685,13 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+json server_task_result_load_lora::to_json() {
+    return json {
+        { "success", true },
+        { "ids",     new_ids },
+    };
+}
+
 //
 // server_prompt_cache
 //

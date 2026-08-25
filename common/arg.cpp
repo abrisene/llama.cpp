@@ -2958,6 +2958,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(common_arg(
+        {"--lora-root"}, "DIR",
+        "directory that runtime-loaded LoRA adapters must resolve under (use comma-separated values for multiple dirs)\n"
+        "if unset, defaults to the parent directories of any --lora/--lora-scaled adapters\n"
+        "(default: unused)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.lora_roots.push_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-scaled"}, "FNAME:SCALE,...",
         "path to LoRA adapter with user defined scaling (format: FNAME:SCALE,...)\n"
         "note: use comma-separated values",

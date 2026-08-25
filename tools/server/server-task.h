@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_LOAD_LORA,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -68,6 +69,7 @@ struct task_params {
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
     std::map<int, float> lora; // mapping adapter ID -> scale
+    std::vector<request_lora_ref> lora_refs; // path-based entries, resolved to ids by launch_slot_with_task
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
@@ -174,6 +176,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_LOAD_LORA
+    std::vector<std::pair<std::string, float>> load_lora; // {path, scale}
+    std::vector<std::string> load_lora_aliases; // parallel to load_lora, "" = no alias
 
     server_task() = default;
 
@@ -560,6 +566,12 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+struct server_task_result_load_lora : server_task_result {
+    std::vector<int> new_ids; // parallel to the request's load_lora, one id per requested path
+
     virtual json to_json() override;
 };
 

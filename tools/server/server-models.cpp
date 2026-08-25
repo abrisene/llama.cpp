@@ -9,6 +9,7 @@
 #include "download.h"
 #include "http.h"
 #include "subproc.h"
+#include "gguf.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
@@ -1824,6 +1825,9 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     payload.size() > 0 ? payload : nullptr,
                     {}, // reset progress info
                 });
+                // Stage 2: push any registered dynamic loras matching this child's arch. safe to
+                // do unconditionally on wakeup-from-sleep too, the child dedups by path
+                router_loras_replay(name);
             } break;
         case SERVER_STATE_SLEEPING:
             {
@@ -1832,6 +1836,364 @@ void server_models::handle_child_state(const std::string & name, const std::stri
         default:
             // should never happen, but just in case
             GGML_ASSERT(false && "unexpected state from child server");
+    }
+}
+
+//
+// server_models: router-side dynamic LoRA registry (Stage 2)
+//
+
+// peek general.architecture from a GGUF file (model or adapter) without allocating tensor data.
+// returns "" on any failure (missing file, bad gguf, missing/wrong-typed key)
+static std::string gguf_peek_architecture(const std::string & path) {
+    struct gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) {
+        return "";
+    }
+    std::string arch;
+    int64_t kid = gguf_find_key(ctx, "general.architecture");
+    if (kid >= 0 && gguf_get_kv_type(ctx, kid) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(ctx, kid);
+    }
+    gguf_free(ctx);
+    return arch;
+}
+
+// extract the (possibly CSV) --lora-root value(s) from one preset. this arg has no .set_env(),
+// so it can't be read via common_preset::get_option(); match on the CLI flag name instead
+static std::vector<std::string> preset_lora_roots(const common_preset & preset) {
+    std::vector<std::string> roots;
+    for (const auto & [opt, value] : preset.options) {
+        if (!opt.args.empty() && std::string(opt.args[0]) == "--lora-root") {
+            for (auto & item : string_split<std::string>(value, ',')) {
+                if (!item.empty()) {
+                    roots.push_back(item);
+                }
+            }
+        }
+    }
+    return roots;
+}
+
+// forward a bare-array /lora-adapters body to one child. returns false and sets `err` on any
+// non-200 response or connection failure
+static bool forward_lora_to_child(int port, const json & body, std::string & err) {
+    httplib::Client cli(CHILD_ADDR, port);
+    cli.set_connection_timeout(0, 5 * 1000 * 1000);
+    cli.set_read_timeout(30, 0);
+    cli.set_write_timeout(30, 0);
+    auto resp = cli.Post("/lora-adapters", body.dump(), "application/json");
+    if (!resp) {
+        err = "connection to child failed";
+        return false;
+    }
+    if (resp->status != 200) {
+        err = "child returned HTTP " + std::to_string(resp->status) + ": " + resp->body;
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::string> server_models::collect_lora_roots() {
+    std::vector<std::string> roots = base_params.lora_roots;
+    std::lock_guard<std::mutex> lk(mutex);
+    for (auto & [name, inst] : mapping) {
+        for (auto & r : preset_lora_roots(inst.meta.preset)) {
+            roots.push_back(r);
+        }
+    }
+    return roots;
+}
+
+std::string server_models::resolve_model_arch(const std::string & name) {
+    std::string model_path;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            return "";
+        }
+        if (!it->second.meta.arch.empty()) {
+            return it->second.meta.arch;
+        }
+        it->second.meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
+    }
+    if (model_path.empty()) {
+        return "";
+    }
+    std::string arch = gguf_peek_architecture(model_path);
+    if (!arch.empty()) {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            it->second.meta.arch = arch;
+        }
+    }
+    return arch;
+}
+
+json server_models::router_loras_add(const json & body) {
+    if (!body.is_array()) {
+        throw std::invalid_argument("request body must be an array of {path, scale, alias?}");
+    }
+
+    std::vector<std::string> roots = collect_lora_roots();
+    json results = json::array();
+
+    for (const auto & item : body) {
+        if (!item.is_object() || !item.contains("path")) {
+            throw std::invalid_argument("each entry must be an object with a 'path' field");
+        }
+        std::string req_path = item.at("path").get<std::string>();
+        float scale = json_value(item, "scale", 1.0f);
+        std::string alias = json_value(item, "alias", std::string());
+
+        std::string safe_path = lora_resolve_safe_path(req_path, roots);
+        if (safe_path.empty()) {
+            results.push_back({
+                {"path",    req_path},
+                {"success", false},
+                {"error",   "path rejected (outside any configured lora-root, or file does not exist)"},
+            });
+            continue;
+        }
+
+        std::string arch = gguf_peek_architecture(safe_path);
+        if (arch.empty()) {
+            results.push_back({
+                {"path",    safe_path},
+                {"success", false},
+                {"error",   "failed to read general.architecture from adapter GGUF"},
+            });
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(lora_registry_mu);
+            auto & entry = lora_registry[safe_path];
+            entry.path  = safe_path;
+            entry.arch  = arch;
+            entry.scale = scale;
+            entry.alias = alias;
+        }
+
+        // forward the full arch-matching registry state, not just this entry: the child endpoint
+        // has SET_LORA semantics (unlisted adapters get scale 0), so a single-entry POST would
+        // silently disable every other registered LoRA on that child
+        json fwd_body = json::array();
+        {
+            std::lock_guard<std::mutex> lk(lora_registry_mu);
+            for (auto & [p, entry] : lora_registry) {
+                if (entry.arch == arch) {
+                    fwd_body.push_back({
+                        {"path",  entry.path},
+                        {"scale", entry.scale},
+                        {"alias", entry.alias},
+                    });
+                }
+            }
+        }
+
+        std::vector<std::string> applied_to;
+        json errors = json::object();
+        for (const auto & meta : get_all_meta()) {
+            if (!meta.is_ready() || resolve_model_arch(meta.name) != arch) {
+                continue;
+            }
+            std::string child_err;
+            if (forward_lora_to_child(meta.port, fwd_body, child_err)) {
+                applied_to.push_back(meta.name);
+                std::lock_guard<std::mutex> lk(lora_registry_mu);
+                auto it = lora_registry.find(safe_path);
+                if (it != lora_registry.end()) {
+                    it->second.applied_to.insert(meta.name);
+                }
+            } else {
+                errors[meta.name] = child_err;
+            }
+        }
+
+        results.push_back({
+            {"path",       safe_path},
+            {"success",    true},
+            {"arch",       arch},
+            {"applied_to", applied_to},
+            {"errors",     errors},
+        });
+    }
+
+    json out = {
+        {"success", true},
+        {"results", results},
+    };
+    // convenience: for the common single-entry request, also mirror the entry's fields at the
+    // top level so callers don't have to unwrap `results[0]` (matches the single-adapter shape)
+    if (results.size() == 1) {
+        for (auto it = results[0].begin(); it != results[0].end(); ++it) {
+            if (it.key() != "success") {
+                out[it.key()] = it.value();
+            }
+        }
+    }
+    return out;
+}
+
+json server_models::router_loras_list() {
+    auto metas = get_all_meta();
+    std::set<std::string> ready_names;
+    for (auto & m : metas) {
+        if (m.is_ready()) {
+            ready_names.insert(m.name);
+        }
+    }
+
+    json out = json::array();
+    std::lock_guard<std::mutex> lk(lora_registry_mu);
+    for (auto & [path, entry] : lora_registry) {
+        std::vector<std::string> applied_to;
+        for (auto & n : entry.applied_to) {
+            if (ready_names.count(n)) {
+                applied_to.push_back(n);
+            }
+        }
+        out.push_back({
+            {"path",       entry.path},
+            {"arch",       entry.arch},
+            {"scale",      entry.scale},
+            {"alias",      entry.alias},
+            {"applied_to", applied_to},
+        });
+    }
+    return out;
+}
+
+json server_models::router_loras_remove(const json & body) {
+    bool all = body.is_object() && json_value(body, "all", false);
+    std::vector<std::string> paths;
+    if (!all) {
+        if (!body.is_array()) {
+            throw std::invalid_argument("request body must be an array of {path} or {\"all\": true}");
+        }
+        for (const auto & item : body) {
+            if (item.is_object() && item.contains("path")) {
+                std::string req_path = item.at("path").get<std::string>();
+                std::error_code ec;
+                auto canon = std::filesystem::weakly_canonical(std::filesystem::path(req_path), ec);
+                paths.push_back(ec ? req_path : canon.string());
+            }
+        }
+    }
+
+    std::vector<server_router_lora_entry> removed;
+    {
+        std::lock_guard<std::mutex> lk(lora_registry_mu);
+        if (all) {
+            for (auto & [path, entry] : lora_registry) {
+                removed.push_back(entry);
+            }
+            lora_registry.clear();
+        } else {
+            for (auto & path : paths) {
+                auto it = lora_registry.find(path);
+                if (it != lora_registry.end()) {
+                    removed.push_back(it->second);
+                    lora_registry.erase(it);
+                }
+            }
+        }
+    }
+
+    // group affected children by arch, then forward the full remaining registry for that arch
+    // (unlisted paths get scale=0 via the child's SET_LORA semantics -- that's how the removed
+    // adapters get zeroed while the remaining ones keep their scales)
+    std::set<std::string> affected_archs;
+    std::set<std::string> affected_children;
+    for (auto & entry : removed) {
+        affected_archs.insert(entry.arch);
+        for (auto & n : entry.applied_to) {
+            affected_children.insert(n);
+        }
+    }
+
+    json errors = json::object();
+    for (const auto & meta : get_all_meta()) {
+        if (!meta.is_ready() || !affected_children.count(meta.name)) {
+            continue;
+        }
+        std::string arch = resolve_model_arch(meta.name);
+        if (!affected_archs.count(arch)) {
+            continue;
+        }
+        json fwd_body = json::array();
+        {
+            std::lock_guard<std::mutex> lk(lora_registry_mu);
+            for (auto & [p, entry] : lora_registry) {
+                if (entry.arch == arch) {
+                    fwd_body.push_back({
+                        {"path",  entry.path},
+                        {"scale", entry.scale},
+                        {"alias", entry.alias},
+                    });
+                }
+            }
+        }
+        std::string child_err;
+        if (!forward_lora_to_child(meta.port, fwd_body, child_err)) {
+            errors[meta.name] = child_err;
+        }
+    }
+
+    return {
+        {"success", true},
+        {"removed", removed.size()},
+        {"errors",  errors},
+    };
+}
+
+void server_models::router_loras_replay(const std::string & name) {
+    std::string arch = resolve_model_arch(name);
+    if (arch.empty()) {
+        return;
+    }
+    auto meta = get_meta(name);
+    if (!meta.has_value() || !meta->is_ready()) {
+        return;
+    }
+
+    std::vector<server_router_lora_entry> matching;
+    {
+        std::lock_guard<std::mutex> lk(lora_registry_mu);
+        for (auto & [path, entry] : lora_registry) {
+            if (entry.arch == arch) {
+                matching.push_back(entry);
+            }
+        }
+    }
+    if (matching.empty()) {
+        return;
+    }
+
+    json fwd_body = json::array();
+    for (auto & entry : matching) {
+        fwd_body.push_back({
+            {"path",  entry.path},
+            {"scale", entry.scale},
+            {"alias", entry.alias},
+        });
+    }
+
+    std::string child_err;
+    if (forward_lora_to_child(meta->port, fwd_body, child_err)) {
+        std::lock_guard<std::mutex> lk(lora_registry_mu);
+        for (auto & entry : matching) {
+            auto it = lora_registry.find(entry.path);
+            if (it != lora_registry.end()) {
+                it->second.applied_to.insert(name);
+            }
+        }
+    } else {
+        SRV_WRN("router: failed to replay lora registry to child name=%s: %s\n", name.c_str(), child_err.c_str());
     }
 }
 
@@ -2353,6 +2715,42 @@ void server_models_routes::init_routes() {
         models.remove(name); // throws on error
 
         res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    // dedicated /lora-adapters POST route: the generic proxy_post reads the routing target from
+    // body{"model"}, but the child's /lora-adapters body is a bare JSON array, so it must come
+    // from ?model= instead (same as proxy_get already does for GET /lora-adapters)
+    this->lora_adapters_post = [this](const server_http_req & req) {
+        std::string name = req.get_param("model");
+        bool autoload = is_autoload(params, req);
+        auto error_res = std::make_unique<server_http_res>();
+        if (!router_validate_model(name, models, autoload, error_res)) {
+            return error_res;
+        }
+        if (autoload) {
+            models.ensure_model_ready(name, req.should_stop);
+        }
+        return models.proxy_request(req, "POST", name, true);
+    };
+
+    this->get_router_loras = [this](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res_ok(res, models.router_loras_list());
+        return res;
+    };
+
+    this->post_router_loras = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        res_ok(res, models.router_loras_add(body)); // throws on malformed input
+        return res;
+    };
+
+    this->del_router_loras = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::array() : json::parse(req.body);
+        res_ok(res, models.router_loras_remove(body)); // throws on malformed input
         return res;
     };
 

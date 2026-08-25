@@ -544,7 +544,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_chat_completions_tok   = models_routes->proxy_post;
     routes.post_responses_tok_oai      = models_routes->proxy_post;
     routes.get_lora_adapters           = models_routes->proxy_get;
-    routes.post_lora_adapters          = models_routes->proxy_post;
+    routes.post_lora_adapters          = models_routes->lora_adapters_post;
     routes.get_slots                   = models_routes->proxy_get;
     routes.post_slots                  = models_routes->proxy_post;
 
@@ -557,6 +557,11 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+
+    // router-native dynamic LoRA registry (Stage 2)
+    ctx_http.get ("/router/loras",         ex_wrapper(models_routes->get_router_loras));
+    ctx_http.post("/router/loras",         ex_wrapper(models_routes->post_router_loras));
+    ctx_http.del ("/router/loras",         ex_wrapper(models_routes->del_router_loras));
 
     server_register_routes(ctx_http, routes);
     server_register_stream_routes(ctx_http,

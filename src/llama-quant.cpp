@@ -1276,6 +1276,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
                 fflush(stdout);
 
+                const size_t out_size =
+                    ggml_row_size(new_type, tensor->ne[0]) * tensor->ne[1] * tensor->ne[2];
+                if (work.size() < out_size) {
+                    work.resize(out_size);
+                }
+                new_data = work.data();
+
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows_per_expert = tensor->ne[1];
                 const int64_t nrows_total = tensor->ne[1] * tensor->ne[2];

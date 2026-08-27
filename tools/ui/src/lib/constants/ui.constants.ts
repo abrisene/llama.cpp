@@ -1,4 +1,6 @@
-import { Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import { ROUTES } from './routes.constants';
+import { Layers, Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
 
@@ -61,6 +63,18 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'New chat'
 	},
 	{ icon: Search, keys: ['cmd', 'k'], tooltip: 'Search' },
+	{
+		activeRouteId: '/mcp-servers',
+		icon: McpLogo,
+		route: ROUTES.MCP_SERVERS,
+		tooltip: 'MCP Servers'
+	},
+	{
+		activeRouteId: '/loras',
+		icon: Layers,
+		route: ROUTES.LORAS,
+		tooltip: 'LoRA Adapters'
+	},
 	{
 		action: SidebarAction.SETTINGS,
 		icon: Settings,

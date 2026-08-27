@@ -1860,6 +1860,24 @@ static std::string gguf_peek_architecture(const std::string & path) {
     return arch;
 }
 
+// peek multiple string keys from a GGUF file in one open. entries in `out` whose key is missing
+// or non-string are left unchanged. returns false if the file couldn't be opened at all
+static bool gguf_peek_strings(const std::string & path, std::map<std::string, std::string> & out) {
+    struct gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) {
+        return false;
+    }
+    for (auto & [key, val] : out) {
+        int64_t kid = gguf_find_key(ctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(ctx, kid) == GGUF_TYPE_STRING) {
+            val = gguf_get_val_str(ctx, kid);
+        }
+    }
+    gguf_free(ctx);
+    return true;
+}
+
 // extract the (possibly CSV) --lora-root value(s) from one preset. this arg has no .set_env(),
 // so it can't be read via common_preset::get_option(); match on the CLI flag name instead
 static std::vector<std::string> preset_lora_roots(const common_preset & preset) {
@@ -1931,6 +1949,54 @@ std::string server_models::resolve_model_arch(const std::string & name) {
         }
     }
     return arch;
+}
+
+json server_models::router_loras_available() {
+    namespace fs = std::filesystem;
+    json out = json::array();
+    std::set<std::string> seen; // dedupe canonical paths across overlapping roots
+
+    for (const auto & root : collect_lora_roots()) {
+        std::error_code ec;
+        fs::path root_canon = fs::weakly_canonical(fs::path(root), ec);
+        if (ec || !fs::is_directory(root_canon, ec)) {
+            continue;
+        }
+        for (auto it = fs::recursive_directory_iterator(root_canon, fs::directory_options::skip_permission_denied, ec);
+                it != fs::recursive_directory_iterator() && !ec;
+                it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            auto ext = it->path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return std::tolower(c); });
+            if (ext != ".gguf") continue;
+
+            std::string canon = it->path().string();
+            if (!seen.insert(canon).second) continue;
+
+            // require both general.type == "adapter" and a non-empty general.architecture; this
+            // filters out full models sitting alongside adapters in the same directory tree
+            std::map<std::string, std::string> kv = {
+                {"general.type",         ""},
+                {"general.architecture", ""},
+                {"adapter.type",         ""},
+                {"adapter.lora.task_name", ""},
+            };
+            if (!gguf_peek_strings(canon, kv)) continue;
+            if (kv["general.type"] != "adapter") continue;
+            if (kv["general.architecture"].empty()) continue;
+
+            uintmax_t sz = fs::file_size(*it, ec);
+            out.push_back({
+                {"path",      canon},
+                {"filename",  it->path().filename().string()},
+                {"arch",      kv["general.architecture"]},
+                {"size_mb",   ec ? 0.0 : (double(sz) / (1024.0 * 1024.0))},
+                {"task_name", kv["adapter.lora.task_name"]},
+            });
+        }
+    }
+
+    return out;
 }
 
 json server_models::router_loras_add(const json & body) {
@@ -2737,6 +2803,12 @@ void server_models_routes::init_routes() {
     this->get_router_loras = [this](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
         res_ok(res, models.router_loras_list());
+        return res;
+    };
+
+    this->get_router_loras_available = [this](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res_ok(res, models.router_loras_available());
         return res;
     };
 

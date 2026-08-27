@@ -146,7 +146,7 @@ export class ChatService {
 			});
 		}
 
-		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+		if (options.model && !modelsStore.props.modelSupportsVision(options.model)) {
 			normalizedMessages.forEach((msg) => {
 				if (Array.isArray(msg.content)) {
 					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {

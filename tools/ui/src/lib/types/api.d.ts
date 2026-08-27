@@ -563,3 +563,88 @@ export interface ApiStreamSession {
 	started_at: number;
 	completed_at: number;
 }
+
+/**
+ * One LoRA adapter entry in the router-side registry, from GET /router/loras.
+ */
+export interface ApiLoraRegistryEntry {
+	path: string;
+	arch: string;
+	scale: number;
+	alias?: string;
+	applied_to: string[];
+}
+
+/**
+ * One entry submitted to POST /router/loras.
+ */
+export interface ApiLoraRegistryAddRequest {
+	path: string;
+	scale: number;
+	alias?: string;
+}
+
+/**
+ * Per-entry outcome inside a POST /router/loras response.
+ */
+export interface ApiLoraRegistryAddResult {
+	path: string;
+	success: boolean;
+	arch?: string;
+	applied_to?: string[];
+	errors?: Record<string, string>;
+	error?: string;
+}
+
+/**
+ * Response from POST /router/loras. The top-level path/arch/applied_to/errors
+ * mirror results[0] when there is exactly one entry in the request.
+ */
+export interface ApiLoraRegistryAddResponse {
+	success: boolean;
+	results: ApiLoraRegistryAddResult[];
+	path?: string;
+	arch?: string;
+	applied_to?: string[];
+	errors?: Record<string, string>;
+	error?: string;
+}
+
+/**
+ * Request body for DELETE /router/loras: either a list of paths to remove,
+ * or { all: true } to clear the whole registry.
+ */
+export type ApiLoraRegistryDeleteRequest = { path: string }[] | { all: true };
+
+/**
+ * Response from DELETE /router/loras.
+ */
+export interface ApiLoraRegistryDeleteResponse {
+	success: boolean;
+	removed: number;
+	errors: Record<string, string>;
+}
+
+/**
+ * One adapter actually resident on a loaded child model, from
+ * GET /lora-adapters?model=X.
+ */
+export interface ApiLoraChildAdapter {
+	id: number;
+	path: string;
+	scale: number;
+	task_name?: string;
+	prompt_prefix?: string;
+}
+
+/**
+ * One .gguf adapter discovered on disk under a configured --lora-root,
+ * from GET /router/loras/available.
+ */
+export interface ApiLoraAvailable {
+	path: string;
+	filename: string;
+	arch: string;
+	size_mb: number;
+	task_name?: string;
+}

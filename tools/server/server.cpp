@@ -245,9 +245,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
 
         // router-native dynamic LoRA registry (Stage 2)
-        ctx_http.get ("/router/loras",         ex_wrapper(models_routes->get_router_loras));
-        ctx_http.post("/router/loras",         ex_wrapper(models_routes->post_router_loras));
-        ctx_http.del ("/router/loras",         ex_wrapper(models_routes->del_router_loras));
+        ctx_http.get ("/router/loras",           ex_wrapper(models_routes->get_router_loras));
+        ctx_http.get ("/router/loras/available", ex_wrapper(models_routes->get_router_loras_available));
+        ctx_http.post("/router/loras",           ex_wrapper(models_routes->post_router_loras));
+        ctx_http.del ("/router/loras",           ex_wrapper(models_routes->del_router_loras));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

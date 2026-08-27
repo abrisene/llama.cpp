@@ -21,6 +21,14 @@ export const API_TOOLS = {
 	LIST: '/tools'
 };
 
+// router-side dynamic LoRA registry, plus the per-child adapters actually
+// resident on a given loaded model
+export const API_LORAS = {
+	AVAILABLE: '/router/loras/available',
+	CHILD_ADAPTERS: '/lora-adapters',
+	REGISTRY: '/router/loras'
+};
+
 // resumable stream routes, the conv::model identity travels as the conv_id query param
 // because model names can contain slashes that a path segment cannot carry
 // resume retry cadence while the owning model is still loading (server answers 503)

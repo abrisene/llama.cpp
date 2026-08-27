@@ -333,6 +333,9 @@ public:
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
+    // enumerate .gguf adapter files under every configured lora-root (deduped by canonical path)
+    json router_loras_available();
+
     // router-side dynamic LoRA registry (Stage 2, thread-safe, no persistence):
     // add/update entries and forward to every currently-loaded child whose arch matches
     json router_loras_add(const json & body);
@@ -406,6 +409,7 @@ struct server_models_routes {
 
     // router-native dynamic LoRA registry (Stage 2)
     server_http_context::handler_t get_router_loras;
+    server_http_context::handler_t get_router_loras_available;
     server_http_context::handler_t post_router_loras;
     server_http_context::handler_t del_router_loras;
 

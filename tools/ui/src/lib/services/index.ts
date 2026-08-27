@@ -158,6 +158,20 @@ export { ModelsService } from './models.service';
 export { HuggingFaceService } from './huggingface.service';
 
 /**
+ * **LorasService** - Router-side dynamic LoRA registry API layer
+ *
+ * Wraps `/router/loras` (list, add/update, delete) and `/lora-adapters`
+ * (per-child resident adapters). No reactive state.
+ *
+ * **Endpoints:**
+ * - `GET /router/loras` — Full registry
+ * - `POST /router/loras` — Add or update one or more adapters
+ * - `DELETE /router/loras` — Remove adapters, or the whole registry
+ * - `GET /lora-adapters?model=X` — Adapters resident on one loaded child
+ */
+export { LorasService } from './loras.service';
+
+/**
  * **PropsService** - Server properties and capabilities retrieval
  *
  * Fetches server configuration, model information, and capabilities from the `/props`

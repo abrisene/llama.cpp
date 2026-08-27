@@ -553,7 +553,7 @@
 
 <svelte:window bind:innerWidth onkeydown={handleKeydown} />
 
-{#if innerWidth > 768 || !page.url.hash.includes(ROUTES.SEARCH)}
+{#if innerWidth > 768 || (!page.url.hash.includes(ROUTES.MCP_SERVERS) && !page.url.hash.includes(ROUTES.LORAS) && !page.url.hash.includes(ROUTES.SEARCH))}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<aside
 		bind:this={asideEl}

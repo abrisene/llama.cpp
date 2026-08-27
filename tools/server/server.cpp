@@ -560,6 +560,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
 
     // router-native dynamic LoRA registry (Stage 2)
     ctx_http.get ("/router/loras",         ex_wrapper(models_routes->get_router_loras));
+    ctx_http.get ("/router/loras/available", ex_wrapper(models_routes->get_router_loras_available));
     ctx_http.post("/router/loras",         ex_wrapper(models_routes->post_router_loras));
     ctx_http.del ("/router/loras",         ex_wrapper(models_routes->del_router_loras));
 

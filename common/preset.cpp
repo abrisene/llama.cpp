@@ -427,6 +427,13 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
     for (const auto & file : files) {
         if (file.is_dir) {
             scan_subdir(file.path, file.name);
+            // recurse one more level for nested org/repo layouts
+            auto subfiles = fs_list(file.path, true);
+            for (const auto & subfile : subfiles) {
+                if (subfile.is_dir) {
+                    scan_subdir(subfile.path, subfile.name);
+                }
+            }
         } else if (string_ends_with(file.name, ".gguf")) {
             if (is_mmproj_file(file.name) || is_draft_file(file.name)) {
                 continue; // companion file, cannot be loaded as a model on its own

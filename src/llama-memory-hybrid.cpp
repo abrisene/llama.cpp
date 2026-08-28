@@ -1,7 +1,6 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
-#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -30,10 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
-    hparams_idx(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
         model.hparams,
@@ -65,20 +62,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )),
-    mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // MQA with a single key head of indexer_head_size, the same shaping
-        // llama_kv_cache_dsa applies to its lightning-indexer cache
-        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
-
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
-
-        return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr);
-    }()) {}
+    )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -125,14 +109,6 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         // prepare the attention cache
-        llama_kv_cache::slot_info_vec_t heads_idx;
-        if (mem_idx) {
-            heads_idx = mem_idx->prepare(ubatches);
-            if (heads_idx.empty()) {
-                break;
-            }
-        }
-
         auto heads_attn = mem_attn->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
@@ -140,7 +116,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
+                this, std::move(heads_attn), std::move(ubatches));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -161,7 +137,6 @@ bool llama_memory_hybrid::get_can_shift() const {
 
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
-    if (mem_idx) mem_idx->clear(data);
     mem_recr->clear(data);
 }
 
@@ -171,31 +146,26 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    if (mem_idx) mem_idx->seq_rm(seq_id, p0, p1);
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    if (mem_idx) mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
-    if (mem_idx) mem_idx->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
-    if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
-    if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
@@ -231,109 +201,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
-uint32_t llama_memory_hybrid::state_seq_components() const {
-    return mem_attn->state_seq_components() | mem_recr->state_seq_components();
-}
-
-uint32_t llama_memory_hybrid::state_seq_capabilities() const {
-    return mem_attn->state_seq_capabilities() | mem_recr->state_seq_capabilities();
-}
-
-size_t llama_memory_hybrid::state_write_range(
-        llama_io_write_i & io,
-        llama_seq_id       seq_id,
-        uint32_t           components,
-        llama_pos          p0,
-        llama_pos          p1,
-        llama_state_seq_flags flags) const {
-    const size_t n_bytes_start = io.n_bytes();
-    const uint32_t known = LLAMA_STATE_SEQ_COMPONENT_ATTENTION | LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
-    if (seq_id < 0 || p0 < 0 || p1 <= p0 || components == 0 || (components & ~known) != 0) {
-        LLAMA_LOG_ERROR("%s: invalid sequence range request (seq=%d, components=0x%x, range=[%d,%d))\n",
-                        __func__, seq_id, components, p0, p1);
-        return 0;
-    }
-
-    if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) != 0) {
-        if ((mem_attn->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
-                (mem_attn->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_SAVE) == 0) {
-            LLAMA_LOG_ERROR("%s: attention range save is unsupported\n", __func__);
-            return 0;
-        }
-        if (mem_attn->state_write_range(io, seq_id, LLAMA_STATE_SEQ_COMPONENT_ATTENTION, p0, p1, flags) == 0) {
-            return 0;
-        }
-    }
-
-    if ((components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0) {
-        if ((mem_recr->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) == 0 ||
-                (mem_recr->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_SAVE) == 0) {
-            LLAMA_LOG_ERROR("%s: recurrent boundary save is unsupported\n", __func__);
-            return 0;
-        }
-        if (mem_recr->state_write_range(io, seq_id, LLAMA_STATE_SEQ_COMPONENT_RECURRENT, p0, p1, flags) == 0) {
-            return 0;
-        }
-    }
-
-    return io.n_bytes() - n_bytes_start;
-}
-
-size_t llama_memory_hybrid::state_read_range(
-        llama_io_read_i & io,
-        llama_seq_id      dest_seq_id,
-        uint32_t          components,
-        llama_pos         p0,
-        llama_pos         p1,
-        llama_state_seq_flags flags) {
-    const size_t n_bytes_start = io.n_bytes();
-    const uint32_t known = LLAMA_STATE_SEQ_COMPONENT_ATTENTION | LLAMA_STATE_SEQ_COMPONENT_RECURRENT;
-    if (dest_seq_id < 0 || p0 < 0 || p1 <= p0 || components == 0 || (components & ~known) != 0) {
-        LLAMA_LOG_ERROR("%s: invalid sequence range request (seq=%d, components=0x%x, range=[%d,%d))\n",
-                        __func__, dest_seq_id, components, p0, p1);
-        return 0;
-    }
-
-    if ((components & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) != 0) {
-        if ((mem_attn->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_ATTENTION) == 0 ||
-                (mem_attn->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_ATTENTION_RANGE_RESTORE) == 0) {
-            LLAMA_LOG_ERROR("%s: attention range restore is unsupported\n", __func__);
-            return 0;
-        }
-        if (mem_attn->state_read_range(io, dest_seq_id, LLAMA_STATE_SEQ_COMPONENT_ATTENTION, p0, p1, flags) == 0) {
-            return 0;
-        }
-    }
-
-    if ((components & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) != 0) {
-        if ((mem_recr->state_seq_components() & LLAMA_STATE_SEQ_COMPONENT_RECURRENT) == 0 ||
-                (mem_recr->state_seq_capabilities() & LLAMA_STATE_SEQ_CAPABILITY_RECURRENT_BOUNDARY_RESTORE) == 0) {
-            LLAMA_LOG_ERROR("%s: recurrent boundary restore is unsupported\n", __func__);
-            return 0;
-        }
-        try {
-            if (mem_recr->state_read_range(io, dest_seq_id, LLAMA_STATE_SEQ_COMPONENT_RECURRENT, p0, p1, flags) == 0) {
-                // Attention may already have been published when the recurrent
-                // sidecar fails.  Remove only the just-restored attention range;
-                // other sequences and positions remain untouched.
-                mem_attn->seq_rm(dest_seq_id, p0, p1);
-                return 0;
-            }
-        } catch (...) {
-            mem_attn->seq_rm(dest_seq_id, p0, p1);
-            throw;
-        }
-    }
-
-    return io.n_bytes() - n_bytes_start;
-}
-
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
-}
-
-llama_kv_cache * llama_memory_hybrid::get_mem_idx() const {
-    return mem_idx.get();
 }
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
@@ -360,14 +229,11 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
 llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-                  slot_info_vec_t   sinfos_idx,
         std::vector<llama_ubatch>   ubatches) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -376,7 +242,6 @@ bool llama_memory_hybrid_context::next() {
 
     ctx_attn->next();
     ctx_recr->next();
-    if (ctx_idx) ctx_idx->next();
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -392,7 +257,6 @@ bool llama_memory_hybrid_context::apply() {
 
     res = res & ctx_attn->apply();
     res = res & ctx_recr->apply();
-    if (ctx_idx) res = res & ctx_idx->apply();
 
     return res;
 }
@@ -412,8 +276,4 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
-}
-
-const llama_kv_cache_context * llama_memory_hybrid_context::get_idx() const {
-    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }

@@ -159,7 +159,7 @@
 							? 'bg-red-400/10 !text-red-400 hover:bg-red-400/20 hover:text-red-400'
 							: 'text-foreground',
 						open && 'text-foreground',
-						'max-w-[min(calc(100vw-4rem) md:max-w-[min(calc(100cqw-9rem),25rem)]'
+						'max-w-[min(calc(100vw-4rem),25rem)] md:max-w-[min(calc(100cqw-9rem),25rem)]'
 					]}
 					disabled={disabled || ms.updating}
 				>

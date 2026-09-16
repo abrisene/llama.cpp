@@ -219,7 +219,7 @@
 												? 'text-foreground'
 												: 'text-foreground',
 									isOpen && 'text-foreground',
-									'max-w-[min(calc(100vw-4rem) md:max-w-[min(calc(100cqw-9rem),25rem)]'
+									'max-w-[min(calc(100vw-4rem),25rem)] md:max-w-[min(calc(100cqw-9rem),25rem)]'
 								]}
 								disabled={disabled || ms.updating}
 							>

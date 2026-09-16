@@ -492,7 +492,8 @@ static bool prefix_cache_append_file_digest(std::vector<uint8_t> & out, const st
         prefix_cache_sha256 digest;
         std::ifstream file(identity.path, std::ios::binary);
         if (!file) return false;
-        std::array<uint8_t, 1024 * 1024> chunk{};
+        // heap, not stack: 1 MiB is the entire default main-thread stack on Windows
+        std::vector<uint8_t> chunk(1024 * 1024);
         while (file) {
             file.read((char *) chunk.data(), (std::streamsize) chunk.size());
             const auto got = file.gcount();

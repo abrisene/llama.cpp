@@ -2014,7 +2014,7 @@ server_tokens format_prompt_rerank(
     if (rerank_prompt != nullptr) {
         // multimodal: append one media marker per image (arrays already flattened by caller)
         std::string q = query;
-        for (size_t i = 0; i < query_files.size(); i++) {
+        for (size_t i = 0; query.find(get_media_marker()) == std::string::npos && i < query_files.size(); i++) {
             q += get_media_marker();
         }
         std::string d = doc;

@@ -8779,7 +8779,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
         if (item.contains("video") || item.contains("fps") || item.contains("max_frames")) {
             throw std::invalid_argument("video/fps/max_frames are not supported for rerank input");
         }
-        json text = item.value("text", json());
+        json text = item.value("text", item.value("prompt_string", json()));
         if (text.is_string()) {
             out_text += text.get<std::string>();
         } else if (text.is_array()) {
@@ -8792,7 +8792,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
         } else if (!text.is_null()) {
             throw std::invalid_argument("\"text\" must be a string or an array of strings");
         }
-        json image = item.value("image", json());
+        json image = item.value("image", item.value("multimodal_data", json()));
         auto add_image = [&](const std::string & url) {
             // marker is appended by format_prompt_rerank, one per decoded file
             try {
@@ -8812,6 +8812,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
             }
         } else if (!image.is_null()) {
             throw std::invalid_argument("\"image\" must be a string or an array of strings");
+        }        if (item.contains("prompt_string") && !out_files.empty()) {
+            const std::string marker = get_media_marker();
+            string_replace_all(out_text, mtmd_default_marker(), marker);
+            if (out_text.find(marker) == std::string::npos) {
+                std::string prefix;
+                for (size_t i = 0; i < out_files.size(); ++i) {
+                    prefix += marker + "\n";
+                }
+                out_text = prefix + out_text;
+            }
         }
     };
 

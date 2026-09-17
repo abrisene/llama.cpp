@@ -54,6 +54,7 @@ import type {
 	DatabaseMessageExtraPdfFile,
 	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtraVideoFile,
+	DatabaseSystemPrompt,
 	ExportedConversation,
 	ExportedConversations,
 	ModelLoadProgress,
@@ -127,6 +128,7 @@ declare global {
 		DatabaseMessageExtraTextFile,
 		DatabaseMessageExtraPdfFile,
 		DatabaseMessageExtraLegacyContext,
+		DatabaseSystemPrompt,
 		ExportedConversation,
 		ExportedConversations,
 		// Enum types

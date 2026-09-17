@@ -95,6 +95,12 @@
 			onUserAction?.();
 			await chatStore.regenerateMessageWithBranching(message.id, modelOverride);
 			refreshAllMessages();
+		},
+
+		rerollKeepingReasoning: async (message: DatabaseMessage) => {
+			onUserAction?.();
+			await chatStore.rerollResponseKeepingReasoning(message.id);
+			refreshAllMessages();
 		}
 	};
 

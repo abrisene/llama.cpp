@@ -268,6 +268,7 @@ export interface ChatMessageActions {
 		newExtras?: DatabaseMessageExtra[]
 	) => void;
 	regenerateWithBranching: (message: DatabaseMessage, modelOverride?: string) => void;
+	rerollKeepingReasoning: (message: DatabaseMessage) => void;
 	continueAssistantMessage: (message: DatabaseMessage) => void;
 	forkConversation: (
 		message: DatabaseMessage,

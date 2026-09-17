@@ -22,6 +22,7 @@
 		toolMessages?: DatabaseMessage[];
 		onContinue?: () => void;
 		onRegenerate: (modelOverride?: string) => void;
+		onRerollKeepingReasoning?: () => void;
 		textareaElement?: HTMLTextAreaElement;
 	}
 
@@ -31,6 +32,7 @@
 		message,
 		onContinue,
 		onRegenerate,
+		onRerollKeepingReasoning,
 		textareaElement = $bindable(),
 		toolMessages = []
 	}: Props = $props();
@@ -187,6 +189,7 @@
 			onContinue={currentConfig.enableContinueGeneration ? onContinue : undefined}
 			onRawOutputToggle={(enabled) => (showRawOutput = enabled)}
 			{onRegenerate}
+			onRerollKeepingReasoning={message.reasoningContent ? onRerollKeepingReasoning : undefined}
 			rawOutputEnabled={showRawOutput}
 			role={MessageRole.ASSISTANT}
 			showRawOutputSwitch={currentConfig.showRawOutputSwitch}

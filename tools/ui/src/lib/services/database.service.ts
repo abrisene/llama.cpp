@@ -6,7 +6,7 @@
  * state; consumed by conversationsStore and the chat flows.
  */
 
-import { IDXDB_STORES, IDXDB_TABLES, STORAGE_APP_NAME } from '$lib/constants';
+import { IDXDB_STORES, IDXDB_STORES_V2, IDXDB_TABLES, STORAGE_APP_NAME } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import type { ExportedConversation } from '$lib/types/database';
@@ -16,11 +16,13 @@ import Dexie, { type EntityTable } from 'dexie';
 class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
 	[IDXDB_TABLES.messages]!: EntityTable<DatabaseMessage, string>;
+	[IDXDB_TABLES.systemPrompts]!: EntityTable<DatabaseSystemPrompt, string>;
 
 	constructor() {
 		super(STORAGE_APP_NAME);
 
 		this.version(1).stores(IDXDB_STORES);
+		this.version(2).stores(IDXDB_STORES_V2);
 	}
 }
 
@@ -701,5 +703,43 @@ export class DatabaseService {
 		if (updates.length === 0) return;
 
 		await db[IDXDB_TABLES.conversations].bulkPut(updates);
+	}
+
+	/**
+	 *
+	 *
+	 * System prompt profiles
+	 *
+	 *
+	 */
+
+	static async listSystemPrompts(): Promise<DatabaseSystemPrompt[]> {
+		return await db[IDXDB_TABLES.systemPrompts].orderBy('updatedAt').reverse().toArray();
+	}
+
+	static async createSystemPrompt(name: string, content: string): Promise<DatabaseSystemPrompt> {
+		const now = Date.now();
+		const prompt: DatabaseSystemPrompt = {
+			content,
+			createdAt: now,
+			id: uuid(),
+			name,
+			updatedAt: now
+		};
+
+		await db[IDXDB_TABLES.systemPrompts].add(prompt);
+
+		return prompt;
+	}
+
+	static async updateSystemPrompt(
+		id: string,
+		updates: Partial<Omit<DatabaseSystemPrompt, 'id' | 'createdAt'>>
+	): Promise<void> {
+		await db[IDXDB_TABLES.systemPrompts].update(id, { ...updates, updatedAt: Date.now() });
+	}
+
+	static async deleteSystemPrompt(id: string): Promise<void> {
+		await db[IDXDB_TABLES.systemPrompts].delete(id);
 	}
 }

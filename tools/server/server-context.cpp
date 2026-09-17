@@ -7077,8 +7077,9 @@ void server_routes::init_routes() {
         json query;
         if (body.count("query") == 1) {
             query = body.at("query");
-            if (!query.is_string()) {
-                res->error(format_error_response("\"query\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            const bool is_mm_obj = query.is_object() && query.contains("prompt_string");
+            if (!query.is_string() && !is_mm_obj) {
+                res->error(format_error_response("\"query\" must be a string or {\"prompt_string\", \"multimodal_data\"}", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
         } else {

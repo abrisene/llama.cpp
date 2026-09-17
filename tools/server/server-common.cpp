@@ -1862,19 +1862,34 @@ server_tokens format_prompt_rerank(
         const struct llama_model * model,
         const struct llama_vocab * vocab,
         mtmd_context * mctx,
-        const std::string & query,
+        const json & query,
         const std::string & doc,
         const mtmd_helper_init_opt & init_opt) {
     server_tokens result = {};
+
+    // the query is either a plain string or {"prompt_string": ..., "multimodal_data": [base64, ...]}
+    // (same shape as a multimodal "prompt"); media markers in the string are expanded by mtmd
+    const bool query_is_obj = query.is_object();
+    const std::string query_str = query_is_obj
+        ? json_value(query, "prompt_string", std::string())
+        : query.get<std::string>();
 
     const char * rerank_prompt = llama_model_chat_template(model, "rerank");
 
     if (rerank_prompt != nullptr) {
         std::string prompt = rerank_prompt;
-        string_replace_all(prompt, "{query}"   , query);
+        string_replace_all(prompt, "{query}"   , query_str);
         string_replace_all(prompt, "{document}", doc  );
-        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true, init_opt);
-        result.push_back(tokens);
+        json json_prompt = prompt;
+        if (query_is_obj && query.contains("multimodal_data")) {
+            json_prompt = json{
+                {"prompt_string",   prompt},
+                {"multimodal_data", query.at("multimodal_data")},
+            };
+        }
+        // return the tokenized prompt as-is: it may carry media chunks, which
+        // server_tokens::push_back(server_tokens &) cannot copy into `result`
+        return tokenize_input_subprompt(vocab, mctx, json_prompt, false, true, init_opt);
     } else {
         // Get EOS token - use SEP token as fallback if EOS is not available
         server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, query, false, false, init_opt);

@@ -1870,9 +1870,34 @@ server_tokens format_prompt_rerank(
     // the query is either a plain string or {"prompt_string": ..., "multimodal_data": [base64, ...]}
     // (same shape as a multimodal "prompt"); media markers in the string are expanded by mtmd
     const bool query_is_obj = query.is_object();
-    const std::string query_str = query_is_obj
+    std::string query_str = query_is_obj
         ? json_value(query, "prompt_string", std::string())
         : query.get<std::string>();
+
+    const bool query_has_media = query_is_obj
+        && query.contains("multimodal_data")
+        && query.at("multimodal_data").is_array()
+        && !query.at("multimodal_data").empty();
+
+    if (query_has_media) {
+        // be lenient about the media marker: the server randomizes it per run
+        // (see get_media_marker), which rerank clients rarely know about.
+        // accept the documented default marker in its place, and if the query
+        // carries no marker at all, put the media in front of the text.
+        const std::string marker = get_media_marker();
+        const std::string default_marker = mtmd_default_marker();
+        if (marker != default_marker) {
+            string_replace_all(query_str, default_marker, marker);
+        }
+        if (query_str.find(marker) == std::string::npos) {
+            std::string prefix;
+            for (size_t i = 0; i < query.at("multimodal_data").size(); i++) {
+                prefix += marker;
+                prefix += "\n";
+            }
+            query_str = prefix + query_str;
+        }
+    }
 
     const char * rerank_prompt = llama_model_chat_template(model, "rerank");
 
@@ -1881,7 +1906,7 @@ server_tokens format_prompt_rerank(
         string_replace_all(prompt, "{query}"   , query_str);
         string_replace_all(prompt, "{document}", doc  );
         json json_prompt = prompt;
-        if (query_is_obj && query.contains("multimodal_data")) {
+        if (query_has_media) {
             json_prompt = json{
                 {"prompt_string",   prompt},
                 {"multimodal_data", query.at("multimodal_data")},

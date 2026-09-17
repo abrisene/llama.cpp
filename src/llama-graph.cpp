@@ -3981,8 +3981,8 @@ void llm_graph_context::build_pooling(
                     }
                 }
 
-                // softmax for qwen3 reranker
-                if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL) {
+                // softmax for qwen3 reranker / qwen3.5 sequence classification
+                if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
                     cur = ggml_soft_max(ctx0, cur);
                 }
             } break;

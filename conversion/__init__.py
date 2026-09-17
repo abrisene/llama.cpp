@@ -367,6 +367,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "Qwen3VLMoeForConditionalGeneration": "qwen3vl",
     "OpenJevModel": "qwen3vl",
     "Qwen3_5ForConditionalGeneration": "qwen3vl",
+    "Qwen3_5ForSequenceClassification": "qwen3vl",
     "Qwen3_5MoeForConditionalGeneration": "qwen3vl",
     "Qwen4ExpForConditionalGeneration": "qwen4exp",
     "RADIOModel": "nemotron",

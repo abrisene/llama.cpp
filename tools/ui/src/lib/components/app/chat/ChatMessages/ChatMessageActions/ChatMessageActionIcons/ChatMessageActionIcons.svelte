@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, Copy, Edit, GitBranch, RefreshCw, Trash2 } from '@lucide/svelte';
+	import { ArrowRight, Copy, Edit, GitBranch, RefreshCw, SkipForward, Trash2 } from '@lucide/svelte';
 	import {
 		ActionIcon,
 		ChatMessageActionIconsBranchingControls,
@@ -17,6 +17,7 @@
 		justify: 'start' | 'end';
 		actionsPosition: 'left' | 'right';
 		onRegenerate?: () => void;
+		onRerollKeepingReasoning?: () => void;
 		onContinue?: () => void;
 		showRawOutputSwitch?: boolean;
 		rawOutputEnabled?: boolean;
@@ -29,6 +30,7 @@
 		onContinue,
 		onRawOutputToggle,
 		onRegenerate,
+		onRerollKeepingReasoning,
 		rawOutputEnabled = false,
 		showRawOutputSwitch = false
 	}: Props = $props();
@@ -83,6 +85,14 @@
 
 			{#if onRegenerate}
 				<ActionIcon icon={RefreshCw} onclick={() => onRegenerate()} tooltip="Regenerate" />
+			{/if}
+
+			{#if onRerollKeepingReasoning}
+				<ActionIcon
+					icon={SkipForward}
+					onclick={onRerollKeepingReasoning}
+					tooltip="Reroll response, keep reasoning"
+				/>
 			{/if}
 
 			{#if onContinue}

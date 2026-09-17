@@ -8,6 +8,7 @@
 
 import {
 	IDXDB_STORE_SCHEMAS,
+	IDXDB_STORES,
 	IDXDB_STORES_V1,
 	IDXDB_TABLES,
 	IDXDB_VERSION,
@@ -24,14 +25,16 @@ class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
 	[IDXDB_TABLES.groups]!: EntityTable<Group, 'id'>;
 	[IDXDB_TABLES.messages]!: EntityTable<DatabaseMessage, string>;
+	[IDXDB_TABLES.systemPrompts]!: EntityTable<DatabaseSystemPrompt, string>;
 
 	constructor() {
 		super(STORAGE_APP_NAME);
 
 		this.version(1).stores(IDXDB_STORES_V1);
-		this.version(IDXDB_VERSION).stores({
+		this.version(2).stores({
 			[IDXDB_TABLES.groups]: IDXDB_STORE_SCHEMAS.groups
 		});
+		this.version(IDXDB_VERSION).stores(IDXDB_STORES);
 	}
 }
 
@@ -840,5 +843,43 @@ export class DatabaseService {
 		if (updates.length === 0) return;
 
 		await db[IDXDB_TABLES.conversations].bulkPut(updates);
+	}
+
+	/**
+	 *
+	 *
+	 * System prompt profiles
+	 *
+	 *
+	 */
+
+	static async listSystemPrompts(): Promise<DatabaseSystemPrompt[]> {
+		return await db[IDXDB_TABLES.systemPrompts].orderBy('updatedAt').reverse().toArray();
+	}
+
+	static async createSystemPrompt(name: string, content: string): Promise<DatabaseSystemPrompt> {
+		const now = Date.now();
+		const prompt: DatabaseSystemPrompt = {
+			content,
+			createdAt: now,
+			id: uuid(),
+			name,
+			updatedAt: now
+		};
+
+		await db[IDXDB_TABLES.systemPrompts].add(prompt);
+
+		return prompt;
+	}
+
+	static async updateSystemPrompt(
+		id: string,
+		updates: Partial<Omit<DatabaseSystemPrompt, 'id' | 'createdAt'>>
+	): Promise<void> {
+		await db[IDXDB_TABLES.systemPrompts].update(id, { ...updates, updatedAt: Date.now() });
+	}
+
+	static async deleteSystemPrompt(id: string): Promise<void> {
+		await db[IDXDB_TABLES.systemPrompts].delete(id);
 	}
 }

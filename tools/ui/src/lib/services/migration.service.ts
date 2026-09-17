@@ -27,6 +27,7 @@ import {
 import { BooleanString, MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import { withSearchChatsDisabled } from '$lib/utils/search-chats';
+import { uuid } from '$lib/utils';
 import Dexie from 'dexie';
 
 // Types
@@ -867,6 +868,61 @@ const searchChatsDefaultDisabledMigration: Migration = {
 		}
 	}
 };
+const SYSTEM_PROMPT_PROFILES_MIGRATION_ID = 'system-prompt-profiles-v1';
+const systemPromptProfilesMigration: Migration = {
+	description:
+		'Migrate the single systemMessage config string into a named systemPrompts profile',
+	id: SYSTEM_PROMPT_PROFILES_MIGRATION_ID,
+
+	async run(): Promise<void> {
+		const configRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+
+		if (configRaw === null) return;
+
+		const config = JSON.parse(configRaw);
+
+		if (
+			SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID in config &&
+			config[SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID]
+		) {
+			return;
+		}
+
+		const legacyMessage =
+			typeof config[SETTINGS_KEYS.SYSTEM_MESSAGE] === 'string'
+				? config[SETTINGS_KEYS.SYSTEM_MESSAGE].trim()
+				: '';
+
+		if (!legacyMessage) return;
+
+		const db = new Dexie(STORAGE_APP_NAME);
+
+		db.version(IDXDB_VERSION).stores(IDXDB_STORES);
+
+		const existing = await db.table(IDXDB_TABLES.systemPrompts).count();
+
+		if (existing > 0) return;
+
+		const now = Date.now();
+		const id = uuid();
+
+		await db.table(IDXDB_TABLES.systemPrompts).add({
+			content: legacyMessage,
+			createdAt: now,
+			id,
+			name: 'Default',
+			updatedAt: now
+		});
+
+		config[SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID] = id;
+		localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(config));
+
+		// Non-destructive: DO NOT delete the legacy systemMessage key - kept as the
+		// downgrade-compat fallback getApiOptions() already reads when no profile is set.
+		if (import.meta.env.DEV && import.meta.env.VITE_DEBUG)
+			console.log('[Migration] System prompts: created "Default" profile from legacy systemMessage');
+	}
+};
 const migrations: Migration[] = [
 	localStorageMigration,
 	idxdbMigration,
@@ -879,7 +935,8 @@ const migrations: Migration[] = [
 	renderKeysMigration,
 	modelOrgNameKeyMigration,
 	mcpServerOverridesToToolPolicyMigration,
-	searchChatsDefaultDisabledMigration
+	searchChatsDefaultDisabledMigration,
+	systemPromptProfilesMigration
 ];
 
 export const MigrationService = {

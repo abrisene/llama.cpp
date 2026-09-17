@@ -326,6 +326,10 @@
 		chatActions.regenerateCompaction(message);
 	}
 
+	function handleRerollKeepingReasoning() {
+		chatActions.rerollKeepingReasoning(message);
+	}
+
 	function handleContinue() {
 		chatActions.continueAssistantMessage(message);
 	}
@@ -436,6 +440,7 @@
 			{message}
 			onContinue={handleContinue}
 			onRegenerate={handleRegenerate}
+			onRerollKeepingReasoning={handleRerollKeepingReasoning}
 			{toolMessages}
 		/>
 	{/if}

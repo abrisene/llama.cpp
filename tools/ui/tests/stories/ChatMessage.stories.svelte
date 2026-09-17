@@ -22,7 +22,8 @@
 		forkConversation: () => {},
 		navigateToSibling: () => {},
 		regenerateCompaction: () => {},
-		regenerateWithBranching: () => {}
+		regenerateWithBranching: () => {},
+		rerollKeepingReasoning: () => {}
 	};
 
 	// Mock messages for different scenarios

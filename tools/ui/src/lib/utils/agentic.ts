@@ -299,6 +299,30 @@ export function buildAssistantRawOutput(sections: AgenticSection[]): string {
 }
 
 /**
+ * Reverses {@link buildAssistantRawOutput}'s reasoning encoding for an edited
+ * assistant message. Pulls the `<think>...</think>` block (if present) back
+ * out into `reasoningContent` so a save writes it to the dedicated field
+ * instead of leaving it inline as visible message text.
+ */
+export function extractReasoningFromRawEdit(raw: string): {
+	content: string;
+	reasoningContent?: string;
+} {
+	const pattern = new RegExp(
+		`${REASONING_TAGS.START}${NEWLINE}([\\s\\S]*?)${NEWLINE}${REASONING_TAGS.END}\\n*`
+	);
+	const match = raw.match(pattern);
+
+	if (!match || match.index === undefined) {
+		return { content: raw };
+	}
+
+	const content = raw.slice(0, match.index) + raw.slice(match.index + match[0].length);
+
+	return { content: content.trim(), reasoningContent: match[1] };
+}
+
+/**
  * Collect consecutive tool messages starting at `startIndex`.
  */
 function collectToolMessages(messages: DatabaseMessage[], startIndex: number): DatabaseMessage[] {

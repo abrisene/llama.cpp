@@ -1,6 +1,9 @@
 <script lang="ts">
 	import { FlaskConical, RotateCcw } from '@lucide/svelte';
-	import { SettingsChatParameterSourceIndicator } from '$lib/components/app/settings';
+	import {
+		SettingsChatParameterSourceIndicator,
+		SettingsChatSystemPrompts
+	} from '$lib/components/app/settings';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import { Input } from '$lib/components/ui/input';
 	import Label from '$lib/components/ui/label/label.svelte';
@@ -120,6 +123,34 @@
 						{@html field.help || SETTING_CONFIG_INFO[field.key]}
 					</p>
 				{/if}
+			{:else if field.type === SettingsFieldType.TEXTAREA && field.key === SETTINGS_KEYS.SYSTEM_MESSAGE}
+				<Label class="block flex items-center gap-1.5 text-sm font-medium" for="system-prompt-name">
+					{field.label}
+				</Label>
+
+				<SettingsChatSystemPrompts
+					activeId={String(localConfig[SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID] ?? '')}
+					onSelectActive={(id) => onConfigChange(SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID, id)}
+				/>
+
+				{#if field.help || SETTING_CONFIG_INFO[field.key]}
+					<p class="mt-1 text-xs text-muted-foreground">
+						{@html field.help || SETTING_CONFIG_INFO[field.key]}
+					</p>
+				{/if}
+
+				<div class="mt-3 flex items-center gap-2">
+					<Checkbox
+						checked={Boolean(localConfig.showSystemMessage ?? true)}
+						id="showSystemMessage"
+						onCheckedChange={(checked) =>
+							onConfigChange(SETTINGS_KEYS.SHOW_SYSTEM_MESSAGE, Boolean(checked))}
+					/>
+
+					<Label class="cursor-pointer text-sm font-normal" for="showSystemMessage">
+						Show system message in conversations
+					</Label>
+				</div>
 			{:else if field.type === SettingsFieldType.TEXTAREA}
 				{#if field.label}
 					<Label class="block flex items-center gap-1.5 text-sm font-medium" for={field.key}>
@@ -143,21 +174,6 @@
 					<p class="mt-1 text-xs text-muted-foreground">
 						{field.help || SETTING_CONFIG_INFO[field.key]}
 					</p>
-				{/if}
-
-				{#if field.key === SETTINGS_KEYS.SYSTEM_MESSAGE}
-					<div class="mt-3 flex items-center gap-2">
-						<Checkbox
-							checked={Boolean(localConfig.showSystemMessage ?? true)}
-							id="showSystemMessage"
-							onCheckedChange={(checked) =>
-								onConfigChange(SETTINGS_KEYS.SHOW_SYSTEM_MESSAGE, Boolean(checked))}
-						/>
-
-						<Label class="cursor-pointer text-sm font-normal" for="showSystemMessage">
-							Show system message in conversations
-						</Label>
-					</div>
 				{/if}
 			{:else if field.type === SettingsFieldType.SELECT}
 				{@const selectedOption = field.options?.find(

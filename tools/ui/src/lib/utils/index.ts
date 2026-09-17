@@ -258,6 +258,7 @@ export {
 export {
 	deriveAgenticSections,
 	buildAssistantRawOutput,
+	extractReasoningFromRawEdit,
 	parseToolResultWithMedia,
 	splitSearchSummaryList,
 	hasAgenticContent,
@@ -267,6 +268,10 @@ export {
 
 // Line-level unified diff for tool result rendering (`edit_file` block)
 export { computeLineDiff, prefixFor, renderUnifiedDiff, type DiffLine } from './compute-line-diff';
+
+// Prompt templating (Jinja2-style pools/randomization), resolved once at message creation
+export { findCompleteExpression, resolvePromptTemplate } from './prompt-template';
+export type { ResolveOptions } from './prompt-template';
 
 // Partial-incremental JSON parser for streaming tool arguments
 export { parsePartialJsonArgs } from './parse-partial-json-args';

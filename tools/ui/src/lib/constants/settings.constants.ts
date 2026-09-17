@@ -4,6 +4,7 @@ import { SETTINGS_KEYS } from './settings-keys.constants';
 import { TITLE_GENERATION } from './title-generation.constants';
 import { FILE_GLOB_SEARCH_PICKERS } from './working-directory.constants';
 import {
+	Ban,
 	Code,
 	Database,
 	Funnel,
@@ -11,7 +12,9 @@ import {
 	Monitor,
 	Moon,
 	PencilRuler,
+	Play,
 	SlidersVertical,
+	SquareCheck,
 	Sun
 } from '@lucide/svelte';
 import { SyncableParameterType } from '$lib/enums';
@@ -83,10 +86,18 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: '',
-				help: 'The starting message that defines how model should behave.',
+				help: 'The starting message that defines how the model should behave. Manage named profiles below; supports Jinja2-style templates (e.g. pools via pick(...)).',
 				key: SETTINGS_KEYS.SYSTEM_MESSAGE,
-				label: 'System Message',
+				label: 'System Prompt',
 				type: SettingsFieldType.TEXTAREA
+			},
+			{
+				defaultValue: '',
+				help: 'Selected system prompt profile id, applied to new conversations.',
+				key: SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID,
+				label: 'Active system prompt profile',
+				standaloneField: false,
+				type: SettingsFieldType.INPUT
 			},
 			{
 				defaultValue: true,
@@ -124,6 +135,19 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				key: SETTINGS_KEYS.ENABLE_CONTINUE_GENERATION,
 				label: 'Enable "Continue" button',
 				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: 'off',
+				help: 'Resolve Jinja2-style templates (pick(...), | random, etc.) in assistant responses. "Post-completion" resolves after streaming finishes (the model does not see the result). "Inline" detects templates during streaming, resolves them, and restarts generation from the resolved text so the model sees and reacts to the concrete value. Both modes break prefix-cache reuse for that turn.',
+				isExperimental: true,
+				key: SETTINGS_KEYS.RESOLVE_RESPONSE_TEMPLATES,
+				label: 'Resolve templates in responses',
+				options: [
+					{ icon: Ban, label: 'Off', value: 'off' },
+					{ icon: SquareCheck, label: 'Post-completion', value: 'post' },
+					{ icon: Play, label: 'Inline (stop & continue)', value: 'inline' }
+				],
+				type: SettingsFieldType.SELECT
 			},
 			{
 				defaultValue: true,

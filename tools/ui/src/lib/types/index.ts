@@ -84,6 +84,7 @@ export type {
 	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtra,
 	DatabaseMessage,
+	DatabaseSystemPrompt,
 	ExportedConversation,
 	ExportedConversations
 } from './database';

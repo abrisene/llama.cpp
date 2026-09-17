@@ -32,12 +32,14 @@ import type {
 } from '$lib/types';
 import {
 	classifyContinueIntent,
+	extractReasoningFromRawEdit,
 	filterByLeafNodeId,
 	findDescendantMessages,
 	findLeafNode,
 	findMessageById,
 	getConversationModel,
-	isAbortError
+	isAbortError,
+	resolvePromptTemplate
 } from '$lib/utils';
 
 /**
@@ -304,7 +306,7 @@ export class ChatMessageFlows {
 
 	async editAssistantMessage(
 		messageId: string,
-		newContent: string,
+		rawContent: string,
 		shouldBranch: boolean
 	): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
@@ -316,15 +318,19 @@ export class ChatMessageFlows {
 		if (!result) return;
 
 		const { index: idx, message: msg } = result;
+		const { content, reasoningContent = '' } = extractReasoningFromRawEdit(
+			resolvePromptTemplate(rawContent)
+		);
 
 		try {
 			if (shouldBranch) {
 				const newMessage = await DatabaseService.createMessageBranch(
 					{
 						children: [],
-						content: newContent,
+						content,
 						convId: msg.convId,
 						model: msg.model,
+						reasoningContent,
 						role: msg.role,
 						timestamp: Date.now(),
 						toolCalls: msg.toolCalls || '',
@@ -335,8 +341,8 @@ export class ChatMessageFlows {
 
 				await conversationsStore.updateCurrentNode(newMessage.id);
 			} else {
-				await DatabaseService.updateMessage(msg.id, { content: newContent });
-				conversationsStore.updateMessageAtIndex(idx, { content: newContent });
+				await DatabaseService.updateMessage(msg.id, { content, reasoningContent });
+				conversationsStore.updateMessageAtIndex(idx, { content, reasoningContent });
 			}
 
 			conversationsStore.updateConversationTimestamp();
@@ -349,7 +355,7 @@ export class ChatMessageFlows {
 
 	async editMessageWithBranching(
 		messageId: string,
-		newContent: string,
+		rawContent: string,
 		newExtras?: DatabaseMessageExtra[]
 	): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
@@ -362,6 +368,7 @@ export class ChatMessageFlows {
 
 		if (!result) return;
 
+		const newContent = resolvePromptTemplate(rawContent);
 		const { index: idx, message: msg } = result;
 
 		try {
@@ -679,7 +686,182 @@ export class ChatMessageFlows {
 		}
 	}
 
-	async updateMessage(messageId: string, newContent: string): Promise<void> {
+	/**
+	 * Regenerates only the visible response, keeping the message's existing
+	 * reasoning fixed. Branches like a full regenerate, but seeds the new
+	 * message with the original reasoningContent and continues generation
+	 * from right after it (continue_final_message), so the model resumes
+	 * past the closing reasoning tag instead of re-thinking from scratch.
+	 */
+	async rerollResponseKeepingReasoning(messageId: string): Promise<void> {
+		const activeConv = conversationsStore.activeConversation;
+
+		if (!activeConv || this.host.isChatLoadingInternal(activeConv.id)) return;
+
+		this.host.cancelPreEncode();
+
+		try {
+			const idx = conversationsStore.findMessageIndex(messageId);
+
+			if (idx === -1) return;
+
+			const msg = conversationsStore.activeMessages[idx];
+
+			if (msg.role !== MessageRole.ASSISTANT || !msg.reasoningContent) return;
+
+			const allMessages = await conversationsStore.getConversationMessages(activeConv.id);
+			const parentMessage = findMessageById(allMessages, msg.parent);
+
+			if (!parentMessage) return;
+
+			const originalReasoning = msg.reasoningContent;
+
+			this.host.showErrorDialog(null);
+			this.host.setChatLoading(activeConv.id, true);
+			this.host.clearChatStreaming(activeConv.id);
+
+			const newAssistantMessage = await DatabaseService.createMessageBranch(
+				{
+					children: [],
+					content: '',
+					convId: msg.convId,
+					model: msg.model,
+					reasoningContent: originalReasoning,
+					role: msg.role,
+					timestamp: Date.now(),
+					toolCalls: '',
+					type: msg.type
+				},
+				parentMessage.id
+			);
+
+			await conversationsStore.updateCurrentNode(newAssistantMessage.id);
+			conversationsStore.updateConversationTimestamp();
+			await conversationsStore.refreshActiveMessages();
+
+			const conversationPath = filterByLeafNodeId(
+				allMessages,
+				parentMessage.id,
+				false
+			) as DatabaseMessage[];
+			const contextWithContinue = [...conversationPath, newAssistantMessage];
+
+			let appendedContent = '';
+
+			const updateStreamingContent = (fullContent: string) => {
+				this.host.setChatStreaming(newAssistantMessage.convId, fullContent, newAssistantMessage.id);
+				conversationsStore.updateMessageAtIndex(
+					conversationsStore.findMessageIndex(newAssistantMessage.id),
+					{ content: fullContent }
+				);
+			};
+
+			const abortController = this.host.getOrCreateAbortController(newAssistantMessage.convId);
+
+			const finishLoading = () => this.host.setChatLoading(activeConv.id, false);
+
+			await ChatService.sendMessage(
+				contextWithContinue,
+				{
+					...this.host.getApiOptions(),
+					continueFinalMessage: true,
+					onChunk: (chunk: string) => {
+						appendedContent += chunk;
+						updateStreamingContent(appendedContent);
+					},
+					onComplete: async (finalContent?: string, _reasoningContent?: string, timings?: ChatMessageTimings) => {
+						const fullContent = appendedContent || finalContent || '';
+
+						await DatabaseService.updateMessage(newAssistantMessage.id, {
+							content: fullContent,
+							timestamp: Date.now(),
+							timings
+						});
+
+						conversationsStore.updateMessageAtIndex(
+							conversationsStore.findMessageIndex(newAssistantMessage.id),
+							{ content: fullContent, timestamp: Date.now(), timings }
+						);
+
+						conversationsStore.updateConversationTimestamp(newAssistantMessage.convId);
+						this.host.cleanupStreaming(newAssistantMessage.convId);
+						finishLoading();
+					},
+					onCompletionId: (id: string) => {
+						if (!id) return;
+
+						conversationsStore.updateMessageAtIndex(
+							conversationsStore.findMessageIndex(newAssistantMessage.id),
+							{ completionId: id }
+						);
+						DatabaseService.updateMessage(newAssistantMessage.id, { completionId: id }).catch(
+							() => {}
+						);
+					},
+					onConnectionState: (state: StreamConnectionState) => {
+						if (newAssistantMessage.convId === conversationsStore.activeConversation?.id) {
+							this.host.streamConnectionState = state;
+						}
+					},
+					onError: async (error: Error) => {
+						if (isAbortError(error)) {
+							if (appendedContent) {
+								await DatabaseService.updateMessage(newAssistantMessage.id, {
+									content: appendedContent,
+									timestamp: Date.now()
+								});
+
+								conversationsStore.updateMessageAtIndex(
+									conversationsStore.findMessageIndex(newAssistantMessage.id),
+									{ content: appendedContent, timestamp: Date.now() }
+								);
+							}
+
+							this.host.cleanupStreaming(newAssistantMessage.convId);
+							finishLoading();
+
+							return;
+						}
+
+						console.error('Failed to reroll response keeping reasoning:', error);
+
+						await DatabaseService.updateMessage(newAssistantMessage.id, {
+							content: appendedContent,
+							timestamp: Date.now()
+						});
+
+						conversationsStore.updateMessageAtIndex(
+							conversationsStore.findMessageIndex(newAssistantMessage.id),
+							{ content: appendedContent, timestamp: Date.now() }
+						);
+
+						this.host.cleanupStreaming(newAssistantMessage.convId);
+						finishLoading();
+						this.host.showErrorDialog({
+							message: error.message,
+							type: error.name === 'TimeoutError' ? ErrorDialogType.TIMEOUT : ErrorDialogType.SERVER
+						});
+					},
+					onTimings: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => {
+						this.host.processing.applyStreamTimings(
+							timings,
+							promptProgress,
+							newAssistantMessage.convId
+						);
+					}
+				},
+				newAssistantMessage.convId,
+				abortController.signal
+			);
+		} catch (error) {
+			if (!isAbortError(error))
+				console.error('Failed to reroll response keeping reasoning:', error);
+
+			if (activeConv) this.host.setChatLoading(activeConv.id, false);
+		}
+	}
+
+	async updateMessage(messageId: string, rawContent: string): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
 
 		if (!activeConv) return;
@@ -690,6 +872,7 @@ export class ChatMessageFlows {
 
 		if (!result) return;
 
+		const newContent = resolvePromptTemplate(rawContent);
 		const { index: messageIndex, message: messageToUpdate } = result;
 		const originalContent = messageToUpdate.content;
 

@@ -20,7 +20,8 @@
 		editWithReplacement: () => {},
 		forkConversation: () => {},
 		navigateToSibling: () => {},
-		regenerateWithBranching: () => {}
+		regenerateWithBranching: () => {},
+		rerollKeepingReasoning: () => {}
 	};
 
 	// Mock messages for different scenarios

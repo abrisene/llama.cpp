@@ -44,6 +44,7 @@ export const SETTINGS_KEYS = {
 	PRESENCE_PENALTY: 'presence_penalty',
 	RENDER_THINKING_AS_MARKDOWN: 'renderThinkingAsMarkdown',
 	RENDER_USER_CONTENT_AS_MARKDOWN: 'renderUserContentAsMarkdown',
+	RESOLVE_RESPONSE_TEMPLATES: 'resolveResponseTemplates',
 	// Penalties
 	REPEAT_LAST_N: 'repeat_last_n',
 	REPEAT_PENALTY: 'repeat_penalty',
@@ -62,6 +63,9 @@ export const SETTINGS_KEYS = {
 	SHOW_SYSTEM_MESSAGE: 'showSystemMessage',
 	SHOW_THOUGHT_IN_PROGRESS: 'showThoughtInProgress',
 	SYMBOLIC_MATH_ENABLED: 'symbolicMathEnabled',
+	/** Selected `DatabaseSystemPrompt.id`; the profile applied to new conversations. */
+	ACTIVE_SYSTEM_PROMPT_ID: 'activeSystemPromptId',
+	/** @deprecated Replaced by named profiles in the `systemPrompts` table. Read by the migration only. */
 	SYSTEM_MESSAGE: 'systemMessage',
 	// Sampling
 	TEMPERATURE: 'temperature',

@@ -47,6 +47,7 @@
 		"@tailwindcss/typography": "0.5.16",
 		"@tailwindcss/vite": "4.1.11",
 		"@types/node": "24.13.0",
+		"@types/nunjucks": "^3.2.6",
 		"@vite-pwa/assets-generator": "1.0.2",
 		"@vite-pwa/sveltekit": "1.1.0",
 		"@vitest/browser": "4.1.10",
@@ -108,5 +109,8 @@
 		"cookie": "1.1.1",
 		"sharp": "0.35.3",
 		"valibot": "1.4.2"
+	},
+	"dependencies": {
+		"nunjucks": "^3.2.4"
 	}
 }

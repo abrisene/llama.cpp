@@ -9,7 +9,12 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
-import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
+import {
+	CWD_CLEARED_TEXT,
+	SETTINGS_KEYS,
+	SYSTEM_MESSAGE_PLACEHOLDER,
+	TITLE_GENERATION
+} from '$lib/constants';
 import {
 	ErrorDialogType,
 	MessageRole,
@@ -42,11 +47,13 @@ import type {
 	ErrorDialogState
 } from '$lib/types';
 import {
+	findCompleteExpression,
 	findMessageById,
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
-	normalizeModelName
+	normalizeModelName,
+	resolvePromptTemplate
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -161,6 +168,27 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		return message;
 	}
+	/**
+	 * Content of the active named system-prompt profile (see
+	 * `SettingsChatSystemPrompts.svelte`), falling back to the legacy single
+	 * `systemMessage` config string for installs that haven't migrated yet.
+	 * Raw template source - callers resolve it themselves.
+	 */
+	async getActiveSystemPromptContent(): Promise<string> {
+		const activeId = settingsStore.config[SETTINGS_KEYS.ACTIVE_SYSTEM_PROMPT_ID] as
+			| string
+			| undefined;
+
+		if (activeId) {
+			const profiles = await DatabaseService.listSystemPrompts();
+			const profile = profiles.find((p) => p.id === activeId);
+
+			if (profile) return profile.content;
+		}
+
+		return settingsStore.config.systemMessage?.toString().trim() ?? '';
+	}
+
 	async addSystemPrompt(): Promise<void> {
 		let activeConv = conversationsStore.activeConversation;
 
@@ -560,6 +588,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.flows.regenerateMessageWithBranching(messageId, modelOverride);
 	}
 
+	async rerollResponseKeepingReasoning(messageId: string): Promise<void> {
+		return this.flows.rerollResponseKeepingReasoning(messageId);
+	}
+
 	async removeSystemPromptPlaceholder(messageId: string): Promise<boolean> {
 		const activeConv = conversationsStore.activeConversation;
 
@@ -613,8 +645,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.pendingDraftMessage = message;
 		this.pendingDraftFiles = [...files];
 	}
-	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
-		if (!content.trim() && (!extras || extras.length === 0)) return;
+	async sendMessage(rawContent: string, extras?: DatabaseMessageExtra[]): Promise<void> {
+		if (!rawContent.trim() && (!extras || extras.length === 0)) return;
+
+		// Resolve any Jinja2-style template (pools via pick(...), etc.) exactly once,
+		// here at message creation. Nothing downstream re-touches it, which keeps the
+		// stored/sent text stable turn-to-turn for prompt-cache reuse.
+		const content = resolvePromptTemplate(rawContent);
 
 		const activeConv = conversationsStore.activeConversation;
 
@@ -658,8 +695,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (isNewConversation) {
 				const rootId = await DatabaseService.createRootMessage(currentConv.id);
-				const currentConfig = settingsStore.config;
-				const systemPrompt = currentConfig.systemMessage?.toString().trim();
+				const systemPrompt = resolvePromptTemplate(await this.getActiveSystemPromptContent());
 
 				let sysOrRootId = rootId;
 
@@ -834,6 +870,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		let streamedReasoningContent = '';
 		let resolvedModel: string | null = null;
 		let modelPersisted = false;
+		let templateAbortResolvedContent: string | null = null;
 
 		const convId = assistantMessage.convId;
 
@@ -961,11 +998,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				return msg;
 			},
 			onAssistantTurnComplete: async (
-				content: string,
+				rawContent: string,
 				reasoningContent: string | undefined,
 				timings: ChatMessageTimings | undefined,
 				toolCalls: import('$lib/types/api').ApiChatCompletionToolCall[] | undefined
 			) => {
+				const resolveMode = settingsStore.config[SETTINGS_KEYS.RESOLVE_RESPONSE_TEMPLATES];
+				const content =
+					resolveMode === 'inline'
+						? resolvePromptTemplate(rawContent, { expressionsOnly: true })
+						: resolveMode === 'post'
+							? resolvePromptTemplate(rawContent)
+							: rawContent;
 				const updateData: Record<string, unknown> = {
 					content,
 					reasoningContent: reasoningContent || undefined,
@@ -1014,10 +1058,101 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				streamedContent += chunk;
 				updateStreamingUI();
 				this.setChatReasoning(convId, false);
+
+				if (
+					settingsStore.config[SETTINGS_KEYS.RESOLVE_RESPONSE_TEMPLATES] === 'inline' &&
+					findCompleteExpression(streamedContent) >= 0
+				) {
+					const resolved = resolvePromptTemplate(streamedContent, { expressionsOnly: true });
+
+					if (resolved !== streamedContent) {
+						templateAbortResolvedContent = resolved;
+						streamedContent = resolved;
+						updateStreamingUI();
+						abortController.abort();
+					}
+				}
 			},
 			onCompletionId: (id: string) => recordCompletionId(id),
 			onError: async (error: Error) => {
 				if (isAbortError(error)) {
+					if (templateAbortResolvedContent !== null) {
+						const resolvedContent = templateAbortResolvedContent;
+						templateAbortResolvedContent = null;
+
+						await DatabaseService.updateMessage(currentMessageId, { content: resolvedContent });
+						const idx = conversationsStore.findMessageIndex(currentMessageId);
+						conversationsStore.updateMessageAtIndex(idx, { content: resolvedContent });
+
+						const contextWithContinue = [
+							...allMessages,
+							{ ...assistantMessage, content: resolvedContent }
+						];
+						const newAbort = this.getOrCreateAbortController(convId);
+
+						streamedContent = resolvedContent;
+
+						try {
+							await ChatService.sendMessage(
+								contextWithContinue,
+								{
+									...this.getApiOptions(),
+									...(effectiveModel ? { model: effectiveModel } : {}),
+									continueFinalMessage: true,
+									onChunk: (chunk: string) => {
+										streamedContent += chunk;
+										updateStreamingUI();
+									},
+									onComplete: async (
+										finalContent?: string,
+										reasoningContent?: string,
+										timings?: ChatMessageTimings
+									) => {
+										const content = resolvePromptTemplate(
+											streamedContent || finalContent || '',
+											{ expressionsOnly: true }
+										);
+										const updateData: Record<string, unknown> = {
+											content,
+											reasoningContent: reasoningContent || undefined,
+											timings
+										};
+
+										if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+
+										await DatabaseService.updateMessage(currentMessageId, updateData);
+										const i = conversationsStore.findMessageIndex(currentMessageId);
+										conversationsStore.updateMessageAtIndex(i, {
+											content,
+											reasoningContent: reasoningContent || undefined
+										});
+										await conversationsStore.updateCurrentNode(currentMessageId);
+										cleanupStreamingState();
+
+										if (onComplete) onComplete(content);
+									},
+									onError: async (e: Error) => {
+										if (isAbortError(e)) {
+											cleanupStreamingState();
+
+											return;
+										}
+
+										console.error('Template continue error:', e);
+										await this.savePartialResponseIfNeeded(convId);
+										cleanupStreamingState();
+									}
+								},
+								convId,
+								newAbort.signal
+							);
+						} catch (e) {
+							if (!isAbortError(e)) console.error('Template continue failed:', e);
+						}
+
+						return;
+					}
+
 					cleanupStreamingState();
 					// If aborted with a pending message (e.g. "Send immediately"), re-send it
 					const pending = this.consumePendingMessage(convId);
@@ -1178,7 +1313,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					timings?: ChatMessageTimings,
 					toolCalls?: string
 				) => {
-					const content = streamedContent || finalContent || '';
+					const rawContent = streamedContent || finalContent || '';
+					const resolveMode2 = settingsStore.config[SETTINGS_KEYS.RESOLVE_RESPONSE_TEMPLATES];
+					const content =
+						resolveMode2 === 'inline'
+							? resolvePromptTemplate(rawContent, { expressionsOnly: true })
+							: resolveMode2 === 'post'
+								? resolvePromptTemplate(rawContent)
+								: rawContent;
 					const reasoning = streamedReasoningContent || reasoningContent;
 					const updateData: Record<string, unknown> = {
 						content,

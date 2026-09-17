@@ -67,6 +67,12 @@ export { default as SettingsMcpServers } from './SettingsMcpServers.svelte';
 export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields.svelte';
 
 /**
+ * Named system-prompt profile manager (select/create/duplicate/rename/delete),
+ * rendered in place of the raw system-message textarea in SettingsChatFields.
+ */
+export { default as SettingsChatSystemPrompts } from './SettingsChat/SettingsChatSystemPrompts.svelte';
+
+/**
  * **SettingsChatToolsTab** - Tools configuration tab for chat settings
  *
  * Displays available tools grouped by source (server, browser, MCP, custom) with

@@ -11,6 +11,15 @@ export interface McpServerOverride {
 	enabled: boolean;
 }
 
+export interface DatabaseSystemPrompt {
+	id: string;
+	name: string;
+	/** Raw template source (may contain Jinja2-style `{{ pick(...) }}` pools); resolved once at use-time. */
+	content: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
 export interface DatabaseConversation {
 	currNode: string | null;
 	id: string;

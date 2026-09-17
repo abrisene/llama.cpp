@@ -48,6 +48,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
+    // sequence-classification / rerank head (Qwen3_5ForSequenceClassification)
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_cls_out }, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_cls_out },         TENSOR_NOT_REQUIRED);
+
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
 

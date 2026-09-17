@@ -3848,6 +3848,16 @@ private:
             }
 
             res->score = embd[0];
+
+            const uint32_t n_cls = llama_model_n_cls_out(model_tgt);
+            if (n_cls > 1) {
+                res->cls_scores.assign(embd, embd + n_cls);
+                res->cls_labels.resize(n_cls);
+                for (uint32_t c = 0; c < n_cls; ++c) {
+                    const char * label = llama_model_cls_label(model_tgt, c);
+                    res->cls_labels[c] = label ? label : "";
+                }
+            }
         }
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);

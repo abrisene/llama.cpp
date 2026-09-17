@@ -1506,11 +1506,20 @@ json server_task_result_embd::to_json_oaicompat() {
 // server_task_result_rerank
 //
 json server_task_result_rerank::to_json() {
-    return json {
+    json res = json {
         {"index",            index},
         {"score",            score},
         {"tokens_evaluated", n_tokens},
     };
+    if (cls_scores.size() > 1) {
+        json probs = json::object();
+        for (size_t i = 0; i < cls_scores.size(); ++i) {
+            const std::string key = i < cls_labels.size() && !cls_labels[i].empty() ? cls_labels[i] : std::to_string(i);
+            probs[key] = cls_scores[i];
+        }
+        res["probs"] = probs;
+    }
+    return res;
 }
 
 //

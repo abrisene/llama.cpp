@@ -490,6 +490,10 @@ struct server_task_result_embd : server_task_result {
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
 
+    // multi-class heads (n_cls_out > 1): every class probability, with its label
+    std::vector<std::string> cls_labels;
+    std::vector<float>       cls_scores;
+
     int32_t n_tokens;
 
     virtual json to_json() override;

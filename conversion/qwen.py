@@ -697,6 +697,59 @@ class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
+@ModelBase.register("Qwen3_5ForSequenceClassification")
+class Qwen3_5ForSequenceClassificationModel(Qwen3_5TextModel):
+    """Qwen3.5 text backbone + a linear `score` head over the last token
+    (e.g. AlexWortega/openjev, a 3-way NLI cross-encoder). Exported as a rank
+    model: `score.weight` becomes `cls.output.weight`, the labels go into
+    `general.classifier_output_labels`, and the model's own pair template (the
+    `nli_template` config key when present) becomes the `rerank` chat template
+    so llama-server's /rerank builds the exact prompt the head was trained on.
+
+    Class rows are reordered so the "positive" label (entailment / yes /
+    relevant, when we can find one) comes first: /rerank sorts by the first
+    output, and that is the score a reranking client wants.
+    """
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    # classification checkpoints drop the MTP block even when the inherited
+    # text config still advertises `mtp_num_hidden_layers`
+    no_mtp = True
+
+    _POSITIVE_LABELS = ("entailment", "yes", "relevant", "positive", "true", "label_1")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        id2label = self.hparams.get("id2label") or {}
+        labels = [id2label[k] for k in sorted(id2label, key=int)] if id2label else []
+        if not labels:
+            n = int(self.hparams.get("num_labels", 1))
+            labels = [f"LABEL_{i}" for i in range(n)]
+        self.cls_order = list(range(len(labels)))
+        for i, lab in enumerate(labels):
+            if lab.lower() in self._POSITIVE_LABELS:
+                self.cls_order = [i] + [j for j in range(len(labels)) if j != i]
+                break
+        self.cls_labels = [labels[i] for i in self.cls_order]
+        logger.info(f"classifier labels (gguf order): {self.cls_labels}")
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
+        self.gguf_writer.add_classifier_output_labels(self.cls_labels)
+        template = self.hparams.get("nli_template")
+        if template:
+            template = template.replace("{premise}", "{query}").replace("{hypothesis}", "{document}")
+            self.gguf_writer.add_chat_template([{"name": "rerank", "template": template}])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in ("score.weight", "score.bias"):
+            suffix = name.split(".")[-1]
+            yield gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.CLS_OUT] + "." + suffix, data_torch[self.cls_order]
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
 @ModelBase.example("Qwen/Qwen3.5-35B-A3B")
 class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):

@@ -1533,6 +1533,9 @@ json format_response_rerank(
             {score_label, json_value(rank, "score", 0.0)},
         };
         n_tokens += json_value(rank, "tokens_evaluated", 0);
+        if (rank.contains("probs")) {
+            elem["probs"] = rank.at("probs");
+        }
         if (return_text) {
             elem["text"] = std::move(texts[index]);
         }

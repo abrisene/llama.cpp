@@ -1599,6 +1599,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         std::vector<float> zeros;
         common_batch_set_zero_state(batch, llama_get_model(ctx), zeros);
         ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (ret == 0) {
+            llama_synchronize(ctx);
+            llama_memory_clear(mem, true);
+            ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
     }
     if (ret != 0) {
         COM_ERR("llama_process() failed: %d\n", ret);

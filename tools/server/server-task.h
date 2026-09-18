@@ -157,6 +157,10 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // used by last-token-pooled embedding/rerank tasks: index of the token whose state is pooled.
+    // tokens after it are right padding so that batched sequences have equal length. -1 = every token is output.
+    int32_t idx_pool = -1;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;

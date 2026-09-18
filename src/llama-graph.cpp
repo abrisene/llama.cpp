@@ -318,6 +318,38 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
             }
         }
 
+        // the model graph keeps only the output rows (inp_out_ids) before pooling, so when not every
+        // token is an output the batch-row index has to be mapped into output-row space
+        // [TAG_POOL_LAST_SPARSE_OUTPUTS]
+        if (ubatch->output) {
+            int32_t n_out = 0;
+            for (int i = 0; i < n_tokens; ++i) {
+                n_out += (ubatch->output[i] != 0);
+            }
+
+            if (n_out != n_tokens) {
+                for (int s = 0; s < n_seqs_unq; ++s) {
+                    if (target_row[s] < 0) {
+                        continue;
+                    }
+
+                    // nearest output row at or before the target; a sequence whose pooled token lives in a
+                    // later ubatch gets a placeholder row here and is overwritten by that ubatch
+                    int32_t row = target_row[s];
+                    while (row > 0 && !ubatch->output[row]) {
+                        --row;
+                    }
+
+                    int32_t idx = 0;
+                    for (int i = 0; i < row; ++i) {
+                        idx += (ubatch->output[i] != 0);
+                    }
+
+                    target_row[s] = n_out > 0 ? std::min(idx, n_out - 1) : 0;
+                }
+            }
+        }
+
         for (int s = 0; s < n_seqs_unq; ++s) {
             if (target_row[s] >= 0) {
                 data[s] = target_row[s];
@@ -3668,6 +3700,11 @@ void llm_graph_context::build_pooling(
         ggml_tensor * cls_out_b,
         ggml_tensor * cls_norm) const {
     if (!cparams.embeddings) {
+        return;
+    }
+
+    // nothing to pool in a ubatch without output rows (see [TAG_POOL_LAST_SPARSE_OUTPUTS])
+    if (n_outputs == 0 && pooling_type != LLAMA_POOLING_TYPE_NONE) {
         return;
     }
 

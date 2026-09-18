@@ -79,6 +79,9 @@ struct llama_context {
 
     enum llama_pooling_type pooling_type() const;
 
+    // true when the pooled embedding / rank score is read from the last token of each sequence only
+    bool pooling_last_token() const;
+
     float * get_logits();
     float * get_logits_ith(int32_t i);
 

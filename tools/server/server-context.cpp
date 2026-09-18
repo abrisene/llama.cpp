@@ -1045,6 +1045,11 @@ struct server_slot {
         if (!task->need_embd()) {
             return true;
         }
+        // a last-token-pooled task marks a single output token and may end in padding; it is only correct when the
+        // whole prompt is decoded in one batch (the pooled row must be extracted from the batch that is sent)
+        if (task->idx_pool >= 0) {
+            return false;
+        }
         // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
         if (!llama_get_memory(ctx_tgt)) {
             return false;
@@ -5117,6 +5122,11 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // the pooled token must be (re-)evaluated in this batch so that it carries the output
+                        if (slot.task->idx_pool >= 0 && n_past > slot.task->idx_pool) {
+                            n_past = slot.task->idx_pool;
+                        }
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -5250,10 +5260,13 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
+                        const bool output = slot.task->idx_pool >= 0
+                            ? slot.prompt.n_tokens() == slot.task->idx_pool
+                            : slot.need_embd();
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* output    = */ output,
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
@@ -5316,7 +5329,10 @@ private:
                         GGML_ASSERT(batch.size() > 0);
 
                         // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        // (last-token-pooled tasks already marked their pooled token; the final token may be padding)
+                        if (slot.task->idx_pool < 0) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
 
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
@@ -7125,6 +7141,31 @@ void server_routes::init_routes() {
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
                 tasks.push_back(std::move(task));
+            }
+
+            // last-token pooling: mark only the pooled token as output and right-pad the pairs to equal
+            // length, so a hybrid/recurrent model runs all of them in a single ubatch (equal-split) instead
+            // of one forward per document. Padding sits after the pooled token, so it cannot affect the score.
+            size_t n_max = 0;
+            for (const auto & task : tasks) {
+                n_max = std::max(n_max, task.tokens.size());
+            }
+            // prompts longer than n_batch keep the splittable all-output path (one document per forward)
+            if (llama_pooling_last_token(ctx_server.ctx_tgt) && n_max <= (size_t) llama_n_batch(ctx_server.ctx_tgt)) {
+                llama_token pad = llama_vocab_pad(ctx_server.vocab);
+                if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_eos(ctx_server.vocab);
+                if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_sep(ctx_server.vocab);
+
+                for (auto & task : tasks) {
+                    // the pooled token must be a text token; a prompt ending in a media chunk keeps the old all-output path
+                    if (task.tokens.empty() || task.tokens[task.tokens.size() - 1] == LLAMA_TOKEN_NULL) {
+                        continue;
+                    }
+                    task.idx_pool = (int32_t) task.tokens.size() - 1;
+                    while (pad != LLAMA_TOKEN_NULL && task.tokens.size() < n_max) {
+                        task.tokens.push_back(pad);
+                    }
+                }
             }
             rd.post_tasks(std::move(tasks));
         }

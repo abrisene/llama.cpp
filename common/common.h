@@ -652,7 +652,7 @@ struct common_params {
     int32_t cache_admission_items     = 8192;
     int32_t cache_recurrent_stride    = 4;
 
-    std::string hostname      = "127.0.0.1";
+    std::vector<std::string> hostnames = {"127.0.0.1"};
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

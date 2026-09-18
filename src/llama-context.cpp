@@ -919,6 +919,12 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+bool llama_context::pooling_last_token() const {
+    return
+        cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ||
+        (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && cparams.causal_attn);
+}
+
 float * llama_context::get_logits() {
     output_reorder();
 
@@ -1747,11 +1753,53 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+
+    // when computing embeddings, all tokens are output ...
+    bool output_all = cparams.embeddings;
+
+    // ... except for last-token pooling, where only the final token of each sequence is needed. Marking just
+    // that token lets recurrent/hybrid memories pack several sequences into one ubatch instead of one
+    // sequence per ubatch (llama_memory_hybrid::init_batch splits by sequence when embd_all is set).
+    // The pooled row is the last output-marked token of each sequence (llm_graph_input_cls), so callers may
+    // right-pad sequences after that token. Only relax when every sequence has at least one output token.
+    // [TAG_POOL_LAST_SPARSE_OUTPUTS]
+    if (output_all && pooling_last_token()) {
+        std::vector<int8_t> seen  (n_seq_max, 0);
+        std::vector<int8_t> marked(n_seq_max, 0);
+
+        bool coupled = false;
+
+        for (const auto & tok : batch_inp.tokens) {
+            // coupled sequences are not supported by the sequential equal split (non-unified KV); keep the old path
+            if (tok.seq_ids.size() != 1) {
+                coupled = true;
+            }
+
+            for (auto seq_id : tok.seq_ids) {
+                if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+                    continue;
+                }
+
+                seen[seq_id] = 1;
+                if (tok.output) {
+                    marked[seq_id] = 1;
+                }
+            }
+        }
+
+        bool all_marked = true;
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (seen[s] && !marked[s]) {
+                all_marked = false;
+                break;
+            }
+        }
+
+        output_all = !all_marked || coupled;
+    }
 
     // TODO: avoid this workaround in the future
     // embedding contexts output every token even when no token is explicitly marked as output
@@ -1970,6 +2018,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
+            // sparse outputs (last-token pooling): a sequence whose pooled token is in another ubatch has only a
+            // placeholder row here - do not let it overwrite the real pooled value [TAG_POOL_LAST_SPARSE_OUTPUTS]
+            std::vector<uint8_t> seq_has_out(ubatch.n_seqs_unq, 1);
+            if (n_outputs_all != n_tokens_all && ubatch.output) {
+                std::fill(seq_has_out.begin(), seq_has_out.end(), 0);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    if (!ubatch.output[i]) {
+                        continue;
+                    }
+                    for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                        seq_has_out[ubatch.seq_idx[ubatch.seq_id[i][s]]] = 1;
+                    }
+                }
+            }
+
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
@@ -1999,6 +2062,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                             const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
+                            if (!seq_has_out[seq_idx]) {
+                                continue;
+                            }
+
                             embd_seq_out[seq_id].resize(n_embd_out);
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
                         }
@@ -2013,6 +2080,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                             const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
+
+                            if (!seq_has_out[seq_idx]) {
+                                continue;
+                            }
 
                             embd_seq_out[seq_id].resize(n_cls_out);
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
@@ -4329,6 +4400,10 @@ const llama_model * llama_get_model(const llama_context * ctx) {
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
+}
+
+bool llama_pooling_last_token(const llama_context * ctx) {
+    return ctx->pooling_last_token();
 }
 
 void llama_attach_threadpool(

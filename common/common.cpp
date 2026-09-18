@@ -1390,7 +1390,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
-    if (params.sampling.backend_sampling) {
+    // pooled (embedding / rerank) contexts output every token, which backend sampling rejects,
+    // and they never sample anyway - keep the samplers off the context there
+    if (params.sampling.backend_sampling && !params.embedding) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }

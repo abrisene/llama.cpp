@@ -90,8 +90,7 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512_q2_ne4")]] kern
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512_q4_ne2")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_q8_0, 8, dequantize_q8_0_t4, block_q8_0,  8, dequantize_q8_0_t4, 576, 512, 2, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512_q4_ne4")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_q8_0, 8, dequantize_q8_0_t4, block_q8_0,  8, dequantize_q8_0_t4, 576, 512, 4, 4>;
 
-#undef FA_TYPES
-#undef FA_TYPES_F32
+
 
 
 template<
@@ -608,3 +607,6 @@ typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4
 
 typedef decltype(kernel_flash_attn_ext_vec_gqa2<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4, 1, 1>) flash_attn_ext_vec_gqa2_t;
 template [[host_name("kernel_flash_attn_ext_vec_gqa2_q8_0_dk256_dv256")]] kernel flash_attn_ext_vec_gqa2_t kernel_flash_attn_ext_vec_gqa2<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4_packed, block_q8_0, 8, dequantize_q8_0_t4_packed, 256, 256, 1, 2, 1>;
+
+#undef FA_TYPES
+#undef FA_TYPES_F32

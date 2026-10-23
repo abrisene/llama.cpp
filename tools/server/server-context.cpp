@@ -8894,7 +8894,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
         if (item.contains("video") || item.contains("fps") || item.contains("max_frames")) {
             throw std::invalid_argument("video/fps/max_frames are not supported for rerank input");
         }
-        json text = item.value("text", item.value("prompt_string", json()));
+        json text = item.value("text", json());
         if (text.is_string()) {
             out_text += text.get<std::string>();
         } else if (text.is_array()) {
@@ -8907,7 +8907,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
         } else if (!text.is_null()) {
             throw std::invalid_argument("\"text\" must be a string or an array of strings");
         }
-        json image = item.value("image", item.value("multimodal_data", json()));
+        json image = item.value("image", json());
         auto add_image = [&](const std::string & url) {
             // marker is appended by format_prompt_rerank, one per decoded file
             try {
@@ -8927,16 +8927,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
             }
         } else if (!image.is_null()) {
             throw std::invalid_argument("\"image\" must be a string or an array of strings");
-        }        if (item.contains("prompt_string") && !out_files.empty()) {
-            const std::string marker = get_media_marker();
-            string_replace_all(out_text, mtmd_default_marker(), marker);
-            if (out_text.find(marker) == std::string::npos) {
-                std::string prefix;
-                for (size_t i = 0; i < out_files.size(); ++i) {
-                    prefix += marker + "\n";
-                }
-                out_text = prefix + out_text;
-            }
         }
     };
 
@@ -8994,30 +8984,31 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
             task.tokens = std::move(tmp);
             tasks.push_back(std::move(task));
         }
-            // last-token pooling: mark only the pooled token as output and right-pad the pairs to equal
-            // length, so a hybrid/recurrent model runs all of them in a single ubatch (equal-split) instead
-            // of one forward per document. Padding sits after the pooled token, so it cannot affect the score.
-            size_t n_max = 0;
-            for (const auto & task : tasks) {
-                n_max = std::max(n_max, task.tokens.size());
-            }
-            // prompts longer than n_batch keep the splittable all-output path (one document per forward)
-            if (llama_pooling_last_token(ctx_server.ctx_tgt) && n_max <= (size_t) llama_n_batch(ctx_server.ctx_tgt)) {
-                llama_token pad = llama_vocab_pad(ctx_server.vocab);
-                if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_eos(ctx_server.vocab);
-                if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_sep(ctx_server.vocab);
 
-                for (auto & task : tasks) {
-                    // the pooled token must be a text token; a prompt ending in a media chunk keeps the old all-output path
-                    if (task.tokens.empty() || task.tokens[task.tokens.size() - 1] == LLAMA_TOKEN_NULL) {
-                        continue;
-                    }
-                    task.idx_pool = (int32_t) task.tokens.size() - 1;
-                    while (pad != LLAMA_TOKEN_NULL && task.tokens.size() < n_max) {
-                        task.tokens.push_back(pad);
-                    }
+        // last-token pooling: mark only the pooled token as output and right-pad the pairs to equal
+        // length, so a hybrid/recurrent model runs all of them in a single ubatch (equal-split) instead
+        // of one forward per document. Padding sits after the pooled token, so it cannot affect the score.
+        size_t n_max = 0;
+        for (const auto & task : tasks) {
+            n_max = std::max(n_max, task.tokens.size());
+        }
+        // prompts longer than n_batch keep the splittable all-output path (one document per forward)
+        if (llama_pooling_last_token(ctx_server.ctx_tgt) && n_max <= (size_t) llama_n_batch(ctx_server.ctx_tgt)) {
+            llama_token pad = llama_vocab_pad(ctx_server.vocab);
+            if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_eos(ctx_server.vocab);
+            if (pad == LLAMA_TOKEN_NULL) pad = llama_vocab_sep(ctx_server.vocab);
+
+            for (auto & task : tasks) {
+                // the pooled token must be a text token; a prompt ending in a media chunk keeps the old all-output path
+                if (task.tokens.empty() || task.tokens[task.tokens.size() - 1] == LLAMA_TOKEN_NULL) {
+                    continue;
+                }
+                task.idx_pool = (int32_t) task.tokens.size() - 1;
+                while (pad != LLAMA_TOKEN_NULL && task.tokens.size() < n_max) {
+                    task.tokens.push_back(pad);
                 }
             }
+        }
         rd.post_tasks(std::move(tasks));
     }
 

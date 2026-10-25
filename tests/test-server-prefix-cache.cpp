@@ -85,6 +85,49 @@ int main() {
     if (adapter_a_key == adapter_b_key) {
         return 1;
     }
+
+    // A request-specific adapter B remains cacheable even when the model
+    // signature describes the broader loaded set {A, B}. Its prompt key is
+    // policy-scoped, and both policies can reuse their own entries on restart.
+    const Key loaded_set_signature = make_key(0x31);
+    const auto loaded_a_key = chain_key(
+        policy_key(loaded_set_signature, {{"/models/adapter-a", 0x3f800000}}),
+        ArtifactKind::ATTENTION, std::nullopt, std::vector<int32_t>{0}, std::vector<int32_t>{42});
+    const auto loaded_b_key = chain_key(
+        policy_key(loaded_set_signature, {{"/models/adapter-b", 0x3f800000}}),
+        ArtifactKind::ATTENTION, std::nullopt, std::vector<int32_t>{0}, std::vector<int32_t>{42});
+    if (loaded_a_key == loaded_b_key) {
+        return 1;
+    }
+    Options loaded_set_options;
+    loaded_set_options.root = root / "loaded-set";
+    loaded_set_options.signature = loaded_set_signature;
+    loaded_set_options.disk_bytes = 1 << 20;
+    loaded_set_options.pending_write_bytes = 1 << 20;
+    loaded_set_options.pending_write_items = 8;
+    loaded_set_options.max_artifact_bytes = 1 << 16;
+    auto loaded_set_store = PrefixCacheStore::open(loaded_set_options);
+    auto request_b = make_artifact(loaded_set_signature, ArtifactKind::ATTENTION, loaded_b_key);
+    if (!loaded_set_store || loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_b_key) ||
+        !loaded_set_store->publish(request_b) ||
+        !loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_b_key)) {
+        return 1;
+    }
+    auto request_a = make_artifact(loaded_set_signature, ArtifactKind::ATTENTION, loaded_a_key);
+    if (!loaded_set_store->publish(request_a) ||
+        !loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_a_key) ||
+        !loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_b_key)) {
+        return 1;
+    }
+    loaded_set_store->shutdown(std::chrono::milliseconds(1000));
+    loaded_set_store = PrefixCacheStore::open(loaded_set_options);
+    if (!loaded_set_store ||
+        !loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_a_key) ||
+        !loaded_set_store->lookup(ArtifactKind::ATTENTION, loaded_b_key)) {
+        return 1;
+    }
+    loaded_set_store->shutdown(std::chrono::milliseconds(1000));
+
     const fs::path disk_root = root / "disk";
 
     Options options;

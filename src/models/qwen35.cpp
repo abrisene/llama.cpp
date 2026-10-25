@@ -43,18 +43,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
-    // optional projection of the embeddings output
-    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
-    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
+    // Qwen3.5 uses the same cls.output tensor names for an embedding
+    // projection and a sequence-classification head. The classifier labels
+    // parsed from metadata select the latter and its class-count dimensions.
+    const bool has_classifier_head = !classifier_labels.empty();
+    const uint32_t n_cls = has_classifier_head ? hparams.n_cls_out : hparams.n_embd_out();
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, n_cls }, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { n_cls },         TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
-
-    // sequence-classification / rerank head (Qwen3_5ForSequenceClassification)
-    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_cls_out }, TENSOR_NOT_REQUIRED);
-    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_cls_out },         TENSOR_NOT_REQUIRED);
 
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];

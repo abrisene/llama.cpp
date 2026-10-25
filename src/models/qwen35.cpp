@@ -227,7 +227,10 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (model.cls_out) {
+    // Embedding projections are part of the model graph, but a sequence
+    // classifier's cls_out is the RANK pooling head and must be applied only
+    // after the final hidden state has been selected by build_pooling().
+    if (model.cls_out && model.classifier_labels.empty()) {
         ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
         if (model.cls_out_b) {
             embd = ggml_add(ctx0, embd, model.cls_out_b);

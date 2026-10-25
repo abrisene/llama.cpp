@@ -2421,6 +2421,7 @@ void server_models::router_loras_replay(
         return;
     }
 
+    bool replay_attempted = false;
     for (;;) {
         std::vector<server_router_lora_entry> matching;
         uint64_t generation;
@@ -2435,7 +2436,11 @@ void server_models::router_loras_replay(
         }
 
         bool forwarded = true;
-        if (!matching.empty()) {
+        // An initially empty registry means the child should keep any LoRAs
+        // configured by its preset. Once replay has begun, however, an empty
+        // snapshot must be sent as SET_LORA too: a concurrent remove may have
+        // emptied the registry after a non-empty snapshot reached the child.
+        if (!matching.empty() || replay_attempted) {
             json fwd_body = json::array();
             for (auto & entry : matching) {
                 fwd_body.push_back({
@@ -2446,6 +2451,7 @@ void server_models::router_loras_replay(
             }
 
             std::string child_err;
+            replay_attempted = true;
             forwarded = forward_lora_to_child(meta->port, fwd_body, child_err);
             if (!forwarded) {
                 SRV_WRN("router: failed to replay lora registry to child name=%s: %s\n", name.c_str(), child_err.c_str());
@@ -2455,6 +2461,14 @@ void server_models::router_loras_replay(
         std::unique_lock<std::mutex> lk(lora_registry_mu);
         if (generation != lora_registry_generation) {
             continue;
+        }
+        if (!forwarded) {
+            lk.unlock();
+            // Keep the model unavailable rather than publishing READY with a
+            // stale or unapplied adapter set. unload() terminates the still-
+            // loading child and the normal monitor path reports its exit.
+            unload(name);
+            return;
         }
         if (forwarded) {
             for (auto & entry : matching) {

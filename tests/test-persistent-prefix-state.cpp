@@ -21,21 +21,17 @@ static llama_context * make_context(const common_params & params, llama_model * 
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, llama_seq_id seq_id) {
-    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i], (llama_pos) i, { seq_id }, i + 1 == tokens.size());
+        batch.add(tokens[i], (llama_pos) i, seq_id, i + 1 == tokens.size());
     }
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 static bool decode_one(llama_context * ctx, llama_token token, llama_pos pos, llama_seq_id seq_id) {
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, token, pos, { seq_id }, true);
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    common_batch batch(ctx);
+    batch.add(token, pos, seq_id, true);
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 static bool get_range_data(

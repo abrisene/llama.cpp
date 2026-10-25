@@ -1959,10 +1959,6 @@ private:
         if (slot.alora_invocation_start >= 0 || lora_all_alora(slot.lora)) {
             return reject("alora");
         }
-        if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
-            return reject("adapter_change");
-        }
-
         const uint32_t components = llama_state_seq_components(ctx_tgt);
         const uint32_t capabilities = llama_state_seq_capabilities(ctx_tgt);
         const uint32_t required_attention =

@@ -406,6 +406,25 @@ Key signature_key(const std::vector<uint8_t> & canonical_signature) {
     Sha256 sha; sha.update(canonical_signature.data(), canonical_signature.size()); return sha.finish();
 }
 
+Key policy_key(const Key & base_signature,
+               const std::vector<std::pair<std::string, uint64_t>> & components) {
+    if (components.empty()) {
+        return base_signature;
+    }
+
+    static constexpr char POLICY_DOMAIN[] = "llama.cpp.prefix-cache.policy.v1";
+    Bytes canonical;
+    canonical.insert(canonical.end(), POLICY_DOMAIN, POLICY_DOMAIN + sizeof(POLICY_DOMAIN) - 1);
+    canonical.insert(canonical.end(), base_signature.bytes.begin(), base_signature.bytes.end());
+    put_u32(canonical, static_cast<uint32_t>(components.size()));
+    for (const auto & [identity, value] : components) {
+        put_u64(canonical, static_cast<uint64_t>(identity.size()));
+        canonical.insert(canonical.end(), identity.begin(), identity.end());
+        put_u64(canonical, value);
+    }
+    return signature_key(canonical);
+}
+
 Key chain_key(const Key & signature, ArtifactKind kind, const std::optional<Key> & parent,
               const std::vector<int32_t> & positions, const std::vector<int32_t> & tokens) {
     Key out;

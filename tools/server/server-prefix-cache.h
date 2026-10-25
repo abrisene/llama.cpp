@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace server_prefix_cache {
@@ -60,6 +61,12 @@ Key chain_key(const Key & signature,
 // Hash an already canonicalized signature.  The returned value is also the
 // namespace name under the store root.
 Key signature_key(const std::vector<uint8_t> & canonical_signature);
+
+// Salt prompt-chain keys with ordered runtime policy components (for example,
+// per-request adapter paths and scale bits) without changing the store's
+// model signature. An empty policy preserves the base signature exactly.
+Key policy_key(const Key & base_signature,
+               const std::vector<std::pair<std::string, uint64_t>> & components);
 
 struct Artifact {
     ArtifactKind kind = ArtifactKind::ATTENTION;

@@ -69,6 +69,22 @@ int main() {
 
     const Key signature = make_key(0x11);
     const Key key = make_key(0x91);
+    const std::vector<std::pair<std::string, uint64_t>> adapter_a = {{"/models/adapter-a", 0x3f800000}};
+    const std::vector<std::pair<std::string, uint64_t>> adapter_b = {{"/models/adapter-a", 0x3f000000}};
+    const Key no_adapter_policy = policy_key(signature, {});
+    const Key adapter_a_policy = policy_key(signature, adapter_a);
+    const Key adapter_b_policy = policy_key(signature, adapter_b);
+    if (no_adapter_policy != signature || adapter_a_policy == signature ||
+        adapter_a_policy == adapter_b_policy || policy_key(signature, adapter_a) != adapter_a_policy) {
+        return 1;
+    }
+    const auto adapter_a_key = chain_key(adapter_a_policy, ArtifactKind::ATTENTION, std::nullopt,
+                                         std::vector<int32_t>{0}, std::vector<int32_t>{42});
+    const auto adapter_b_key = chain_key(adapter_b_policy, ArtifactKind::ATTENTION, std::nullopt,
+                                         std::vector<int32_t>{0}, std::vector<int32_t>{42});
+    if (adapter_a_key == adapter_b_key) {
+        return 1;
+    }
     const fs::path disk_root = root / "disk";
 
     Options options;
@@ -145,6 +161,33 @@ int main() {
     store->shutdown(std::chrono::milliseconds(1000));
 
     // Restart discovers the immutable file without loading its payload first.
+    store = PrefixCacheStore::open(options);
+    if (!store || !store->lookup(ArtifactKind::ATTENTION, key)) {
+        return 1;
+    }
+
+    // Runtime model policies use separate signatures at the same root. A
+    // different adapter signature must miss, while each policy can reuse its
+    // own immutable artifact after restart.
+    Options alternate_options = options;
+    alternate_options.signature = make_key(0x22);
+    auto alternate = PrefixCacheStore::open(alternate_options);
+    Artifact alternate_artifact = make_artifact(
+        alternate_options.signature, ArtifactKind::ATTENTION, key
+    );
+    if (!alternate || alternate->lookup(ArtifactKind::ATTENTION, key) ||
+        !alternate->publish(alternate_artifact) ||
+        !alternate->lookup(ArtifactKind::ATTENTION, key) ||
+        !store->lookup(ArtifactKind::ATTENTION, key)) {
+        return 1;
+    }
+    alternate->shutdown(std::chrono::milliseconds(1000));
+    alternate = PrefixCacheStore::open(alternate_options);
+    if (!alternate || !alternate->lookup(ArtifactKind::ATTENTION, key)) {
+        return 1;
+    }
+    alternate->shutdown(std::chrono::milliseconds(1000));
+    store->shutdown(std::chrono::milliseconds(1000));
     store = PrefixCacheStore::open(options);
     if (!store || !store->lookup(ArtifactKind::ATTENTION, key)) {
         return 1;

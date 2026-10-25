@@ -89,6 +89,21 @@ def test_rerank_tei_format():
     assert least_relevant["index"] == 3
 
 
+def test_rerank_accepts_legacy_prompt_string_shape():
+    global server
+    server.start()
+    res = server.make_request("POST", "/rerank", data={
+        "query": {"prompt_string": "Machine learning is"},
+        "documents": [
+            {"prompt_string": "A machine is a physical system."},
+            {"prompt_string": "Machine learning studies algorithms."},
+        ],
+    })
+    assert res.status_code == 200
+    assert len(res.body["results"]) == 2
+    assert res.body["results"][0]["index"] == 1
+
+
 @pytest.mark.parametrize("documents", [
     [],
     None,

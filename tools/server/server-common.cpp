@@ -2106,15 +2106,24 @@ server_tokens format_prompt_rerank(
     const char * rerank_prompt = llama_model_chat_template(model, "rerank");
 
     if (rerank_prompt != nullptr) {
-        // multimodal: append one media marker per image (arrays already flattened by caller)
+        // The route normalizes markers before this point. Keep this helper
+        // robust for direct callers by appending only missing markers.
+        auto append_missing_markers = [](std::string & text, size_t media_count) {
+            const std::string marker = get_media_marker();
+            size_t marker_count = 0;
+            for (size_t pos = 0; (pos = text.find(marker, pos)) != std::string::npos;
+                 pos += marker.size()) {
+                marker_count++;
+            }
+            for (; marker_count < media_count; ++marker_count) {
+                text += marker;
+            }
+        };
+
         std::string q = query;
-        for (size_t i = 0; i < query_files.size(); i++) {
-            q += get_media_marker();
-        }
+        append_missing_markers(q, query_files.size());
         std::string d = doc;
-        for (size_t i = 0; i < doc_files.size(); i++) {
-            d += get_media_marker();
-        }
+        append_missing_markers(d, doc_files.size());
 
         std::string prompt = format_rerank_template(rerank_prompt, q, d);
 

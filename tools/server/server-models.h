@@ -299,6 +299,7 @@ private:
     // and forwarding to children does blocking HTTP I/O that must not be done under `mutex`
     std::mutex lora_registry_mu;
     std::map<std::string, server_router_lora_entry> lora_registry;
+    uint64_t lora_registry_generation = 0; // guarded by lora_registry_mu
 
     // union of lora-roots across all configured presets plus any router-level --lora-root
     std::vector<std::string> collect_lora_roots();
@@ -418,8 +419,9 @@ public:
     json router_loras_list();
     // remove entries (by path, or all) and ask arch-matching loaded children to zero the scale
     json router_loras_remove(const json & body);
-    // forward registry entries matching this child's arch, called once it reports ready
-    void router_loras_replay(const std::string & name);
+    // replay matching registry entries before publishing child readiness; retries if the
+    // registry changes during forwarding so waiting requests see the applied state
+    void router_loras_replay(const std::string & name, const update_status_args & ready_state);
 
 private:
     // one thread watching every child; keep last, the destructor joins the thread

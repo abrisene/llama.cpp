@@ -2013,15 +2013,15 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     }
                     info.erase("memory");
                 }
-                update_status(name, {
+                const update_status_args ready_state = {
                     SERVER_MODEL_STATUS_LOADED,
                     0,
                     // note: payload can be empty if this is a wakeup from sleep
                     info.size() > 0 ? info : nullptr,
                     {}, // reset progress info
                     memory,
-                });
-                router_loras_replay(name);
+                };
+                router_loras_replay(name, ready_state);
             } break;
         case SERVER_STATE_SLEEPING:
             {
@@ -2233,6 +2233,7 @@ json server_models::router_loras_add(const json & body) {
             entry.arch  = arch;
             entry.scale = scale;
             entry.alias = alias;
+            lora_registry_generation++;
         }
 
         // forward the full arch-matching registry state, not just this entry: the child endpoint
@@ -2359,6 +2360,9 @@ json server_models::router_loras_remove(const json & body) {
                 }
             }
         }
+        if (!removed.empty()) {
+            lora_registry_generation++;
+        }
     }
 
     // group affected children by arch, then forward the full remaining registry for that arch
@@ -2408,49 +2412,63 @@ json server_models::router_loras_remove(const json & body) {
     };
 }
 
-void server_models::router_loras_replay(const std::string & name) {
+void server_models::router_loras_replay(
+        const std::string & name,
+        const update_status_args & ready_state) {
     std::string arch = resolve_model_arch(name);
-    if (arch.empty()) {
-        return;
-    }
     auto meta = get_meta(name);
-    if (!meta.has_value() || !meta->is_ready()) {
+    if (!meta.has_value()) {
         return;
     }
 
-    std::vector<server_router_lora_entry> matching;
-    {
-        std::lock_guard<std::mutex> lk(lora_registry_mu);
-        for (auto & [path, entry] : lora_registry) {
-            if (entry.arch == arch) {
-                matching.push_back(entry);
+    for (;;) {
+        std::vector<server_router_lora_entry> matching;
+        uint64_t generation;
+        {
+            std::lock_guard<std::mutex> lk(lora_registry_mu);
+            generation = lora_registry_generation;
+            for (auto & [path, entry] : lora_registry) {
+                if (!arch.empty() && entry.arch == arch) {
+                    matching.push_back(entry);
+                }
             }
         }
-    }
-    if (matching.empty()) {
+
+        bool forwarded = true;
+        if (!matching.empty()) {
+            json fwd_body = json::array();
+            for (auto & entry : matching) {
+                fwd_body.push_back({
+                    {"path",  entry.path},
+                    {"scale", entry.scale},
+                    {"alias", entry.alias},
+                });
+            }
+
+            std::string child_err;
+            forwarded = forward_lora_to_child(meta->port, fwd_body, child_err);
+            if (!forwarded) {
+                SRV_WRN("router: failed to replay lora registry to child name=%s: %s\n", name.c_str(), child_err.c_str());
+            }
+        }
+
+        std::unique_lock<std::mutex> lk(lora_registry_mu);
+        if (generation != lora_registry_generation) {
+            continue;
+        }
+        if (forwarded) {
+            for (auto & entry : matching) {
+                auto it = lora_registry.find(entry.path);
+                if (it != lora_registry.end()) {
+                    it->second.applied_to.insert(name);
+                }
+            }
+        }
+        // Keep registry mutations serialized with readiness publication. An add
+        // that wins before this point changes the generation and is replayed;
+        // an add after it sees the child as ready and forwards itself.
+        update_status(name, ready_state);
         return;
-    }
-
-    json fwd_body = json::array();
-    for (auto & entry : matching) {
-        fwd_body.push_back({
-            {"path",  entry.path},
-            {"scale", entry.scale},
-            {"alias", entry.alias},
-        });
-    }
-
-    std::string child_err;
-    if (forward_lora_to_child(meta->port, fwd_body, child_err)) {
-        std::lock_guard<std::mutex> lk(lora_registry_mu);
-        for (auto & entry : matching) {
-            auto it = lora_registry.find(entry.path);
-            if (it != lora_registry.end()) {
-                it->second.applied_to.insert(name);
-            }
-        }
-    } else {
-        SRV_WRN("router: failed to replay lora registry to child name=%s: %s\n", name.c_str(), child_err.c_str());
     }
 }
 

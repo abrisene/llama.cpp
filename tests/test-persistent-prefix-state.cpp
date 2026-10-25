@@ -76,6 +76,14 @@ static void put_u64_le(uint8_t * dst, uint64_t value) {
     }
 }
 
+static size_t attention_metadata_cell_size(bool mrope_text) {
+    // Each serialized cell stores its position and sequence count, an optional
+    // M-RoPE extension (x, y, token), then one sequence ID for this test.
+    return sizeof(llama_pos) + sizeof(uint32_t) +
+           (mrope_text ? 2 * sizeof(llama_pos) + sizeof(llama_token) : 0) +
+           sizeof(llama_seq_id);
+}
+
 static bool patch_attention_position(
         std::vector<uint8_t> & data,
         size_t index,
@@ -83,7 +91,7 @@ static bool patch_attention_position(
         bool mrope_text) {
     constexpr size_t header_size = 44;
     constexpr size_t cell_count_size = 4;
-    const size_t metadata_cell_size = mrope_text ? 20 : 12;
+    const size_t metadata_cell_size = attention_metadata_cell_size(mrope_text);
     if (data.size() < header_size + cell_count_size + (index + 1) * metadata_cell_size) {
         return false;
     }
@@ -100,8 +108,9 @@ static bool patch_attention_ext(
         llama_pos y) {
     constexpr size_t header_size = 44;
     constexpr size_t cell_count_size = 4;
-    constexpr size_t metadata_cell_size = 20;
-    const size_t ext_offset = header_size + cell_count_size + index * metadata_cell_size + 8;
+    const size_t metadata_cell_size = attention_metadata_cell_size(true);
+    const size_t ext_offset = header_size + cell_count_size + index * metadata_cell_size +
+                              sizeof(llama_pos) + sizeof(uint32_t);
     if (data.size() < ext_offset + 2 * sizeof(llama_pos)) {
         return false;
     }
@@ -321,8 +330,8 @@ static bool test_recurrent_boundary_and_logits(
 
     for (const auto & [range, data] : attention_ranges) {
         std::vector<uint8_t> restored;
-        const size_t metadata_cell_size =
-            attention_flags == LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT ? 20 : 12;
+        const size_t metadata_cell_size = attention_metadata_cell_size(
+            attention_flags == LLAMA_STATE_SEQ_FLAGS_MROPE_TEXT);
         const size_t data_offset = 44 + 4 + (range.p1 - range.p0) * metadata_cell_size;
         if (!get_range_data(ctx, dest_seq_id, LLAMA_STATE_SEQ_COMPONENT_ATTENTION, range,
                             attention_flags, restored) ||

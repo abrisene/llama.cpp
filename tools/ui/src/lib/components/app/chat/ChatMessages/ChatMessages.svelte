@@ -98,7 +98,6 @@
 		},
 
 		rerollKeepingReasoning: async (message: DatabaseMessage) => {
-			onUserAction?.();
 			await chatStore.rerollResponseKeepingReasoning(message.id);
 			refreshAllMessages();
 		}

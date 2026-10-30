@@ -770,10 +770,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
-	savePendingDraft(message: string, files: ChatUploadedFile[]): void {
-		this.pendingDraftMessage = message;
-		this.pendingDraftFiles = [...files];
-	}
 	async sendMessage(rawContent: string, extras?: DatabaseMessageExtra[]): Promise<void> {
 		if (!rawContent.trim() && (!extras || extras.length === 0)) return;
 

@@ -3,6 +3,8 @@
 #include "json-schema-to-grammar.h"
 
 #include <unordered_set>
+#include <cmath>
+#include <limits>
 
 namespace server_schema {
 
@@ -230,6 +232,34 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("speculative.ngram_min_hits", params.speculative.ngram_simple.min_hits))
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
+
+    add((new field_json("activation_edits"))
+        ->set_desc("Add finite values to zero-based post-block residual layer/channel pairs")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & edits = data.at("activation_edits");
+            if (!edits.is_array()) {
+                throw std::invalid_argument("activation_edits must be an array");
+            }
+            for (const auto & edit : edits) {
+                if (!edit.is_object() || edit.size() != 3 || !edit.contains("layer") ||
+                    !edit.contains("neuron") || !edit.contains("add") ||
+                    !edit.at("layer").is_number_integer() || !edit.at("neuron").is_number_integer() ||
+                    !edit.at("add").is_number()) {
+                    throw std::invalid_argument("activation_edits requires integer layer/neuron and numeric add");
+                }
+                const double layer = edit.at("layer").get<double>();
+                const double neuron = edit.at("neuron").get<double>();
+                const double add = edit.at("add").get<double>();
+                if (layer < 0 || layer > INT32_MAX || neuron < 0 || neuron > INT32_MAX ||
+                    !std::isfinite(add) || std::abs(add) > std::numeric_limits<float>::max()) {
+                    throw std::invalid_argument("activation_edits index or add is out of range");
+                }
+                if (!ctx.params.activation_edits.emplace(
+                        std::make_pair((int32_t) layer, (int32_t) neuron), (float) add).second) {
+                    throw std::invalid_argument("activation_edits contains a duplicate layer/neuron pair");
+                }
+            }
+        }));
 
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields, "
@@ -493,6 +523,9 @@ task_params eval_llama_cmpl_schema(
                 const common_params & params_base,
                 const std::vector<llama_logit_bias> & logit_bias_eog,
                 const json & data) {
+    if (data.contains("activation_edits") && data.at("activation_edits").is_null()) {
+        throw std::invalid_argument("activation_edits must be an array");
+    }
     task_params params;
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
@@ -520,6 +553,11 @@ task_params eval_llama_cmpl_schema(
     // eval all fields in the schema
     for (const auto & f : schema) {
         f->eval(ctx, data);
+    }
+
+    if (!params.activation_edits.empty()) {
+        params.cache_prompt = false;
+        params.n_cache_reuse = 0;
     }
 
     // debugging

@@ -1805,6 +1805,10 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
+bool llama_context::supports_adapter_cvec(int32_t layer) const {
+    return cvec->supports_layer(layer, model.hparams.n_embd);
+}
+
 bool llama_context::set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -5214,6 +5218,10 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+bool llama_supports_adapter_cvec(llama_context * ctx, int32_t layer) {
+    return ctx->supports_adapter_cvec(layer);
 }
 
 int32_t llama_set_adapter_cvec(

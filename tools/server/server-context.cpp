@@ -13,6 +13,7 @@
 #include "server-stream.h"
 #include "server-decode-arbiter.h"
 #include "server-prefix-admission.h"
+#include "server-activation.h"
 #include "server-prefix-cache.h"
 
 #include "build-info.h"
@@ -932,7 +933,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
+        if (prompt.tokens.size() == 0 || (task && !task->params.activation_edits.empty())) {
             return false;
         }
 
@@ -1158,7 +1159,8 @@ struct server_slot {
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
-            && are_lora_equal(lora, other_slot.lora);
+            && are_lora_equal(lora, other_slot.lora)
+            && task->params.activation_edits == other_slot.task->params.activation_edits;
     }
 
     // returns -1 if the generation is limitless
@@ -1281,7 +1283,7 @@ struct server_slot {
 
             // do not keep context of the child slots - the parent's context is enough
             // nor of the stateless slots - no task ever reuses it
-            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME || !task->params.activation_edits.empty()) {
                 prompt_clear();
             }
 
@@ -1769,6 +1771,8 @@ private:
         uint64_t queue_us = 0;
         std::map<std::string, uint64_t> ineligible_reasons;
     } prefix_cache_metrics;
+
+    common_control_vector_data activation_base = {-1, {}};
 
     std::unique_ptr<server_prefix_cache::PrefixAdmission> prefix_cache_admission;
 
@@ -2870,6 +2874,14 @@ private:
             return false;
         }
 
+        activation_base = {-1, {}};
+        if (!params_base.control_vectors.empty()) {
+            activation_base = common_control_vector_load(params_base.control_vectors, llama_model_n_layer(model_tgt));
+            if (activation_base.n_embd != llama_model_n_embd(model_tgt)) {
+                return false;
+            }
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         try {
@@ -3463,7 +3475,7 @@ private:
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
-            update_cache = update_cache && !task.is_stateless();
+            update_cache = update_cache && !task.is_stateless() && task.params.activation_edits.empty();
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -3621,6 +3633,30 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!task.params.activation_edits.empty()) {
+            if (spec || task.tokens.has_mtmd || task.type != SERVER_TASK_TYPE_COMPLETION || task.is_stateless()) {
+                send_error(task, "activation_edits requires ordinary text completion without speculation", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            for (const auto & edit : task.params.activation_edits) {
+                if (edit.first.first >= llama_model_n_layer(model_tgt) ||
+                    edit.first.second >= llama_model_n_embd(model_tgt) ||
+                    !llama_supports_adapter_cvec(ctx_tgt, edit.first.first)) {
+                    send_error(task, "activation_edits layer/neuron is outside the model residual graph", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+                const int32_t layer = edit.first.first;
+                const size_t offset = layer > 0 ? (size_t) (layer - 1) * activation_base.n_embd + edit.first.second : 0;
+                if (activation_base.n_embd > 0 && layer >= std::max(1, params_base.control_vector_layer_start) &&
+                    (params_base.control_vector_layer_end <= 0 || layer <= params_base.control_vector_layer_end) &&
+                    offset < activation_base.data.size() && !std::isfinite(activation_base.data[offset] + edit.second)) {
+                    send_error(task, "activation edit overflows startup control vector", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+            slot.prompt_clear();
+        }
+
         // resolve path-based lora refs (dynamic loading) to ids before building the lora list;
         // this runs synchronously on the main scheduler thread, same as SERVER_TASK_TYPE_LOAD_LORA
         if (!task.params.lora_refs.empty()) {
@@ -5399,6 +5435,10 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
+                server_activation_scope activation(ctx_tgt, activation_base,
+                        std::max(1, params_base.control_vector_layer_start),
+                        params_base.control_vector_layer_end <= 0 ? llama_model_n_layer(model_tgt) : params_base.control_vector_layer_end,
+                        batch.slot_batched->task->params.activation_edits);
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -7117,6 +7157,7 @@ server_context_meta server_context::get_meta() const {
         /* model_vocab_n_tokens    */ llama_vocab_n_tokens(impl->vocab),
         /* model_n_ctx_train       */ llama_model_n_ctx_train(impl->model_tgt),
         /* model_n_embd_inp        */ llama_model_n_embd(impl->model_tgt),
+        /* model_n_layer           */ llama_model_n_layer(impl->model_tgt),
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
@@ -7514,6 +7555,7 @@ static json get_res_model_info(const server_context_meta & meta) {
             {"n_ctx",       meta.slot_n_ctx},
             {"n_ctx_train", meta.model_n_ctx_train},
             {"n_embd",      meta.model_n_embd_inp},
+            {"n_layer",     meta.model_n_layer},
             {"n_params",    meta.model_n_params},
             {"size",        meta.model_size},
             {"ftype",       meta.model_ftype},

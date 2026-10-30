@@ -22,12 +22,18 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
 }
 
 ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+    layer_widths[il] = cur->ne[0];
     ggml_tensor * layer_dir = tensor_for(il);
     if (layer_dir != nullptr) {
         cur = ggml_add(ctx, cur, layer_dir);
     }
 
     return cur;
+}
+
+bool llama_adapter_cvec::supports_layer(int il, int32_t width) const {
+    const auto it = layer_widths.find(il);
+    return it != layer_widths.end() && it->second == width;
 }
 
 bool llama_adapter_cvec::init(const llama_model & model) {
@@ -64,8 +70,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
 
     // make tensors
     tensors.reserve(hparams.n_layer());
-    tensors.push_back(nullptr); // there's never a tensor for layer 0
-    for (size_t il = 1; il < hparams.n_layer(); il++) {
+    for (size_t il = 0; il < hparams.n_layer(); il++) {
         ggml_backend_buffer_type_t buft = model.select_buft(il);
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -114,6 +119,12 @@ bool llama_adapter_cvec::apply(
         return false;
     }
 
+    if (il_start == 0 && (il_end < 0 || il_end >= (int32_t) hparams.n_layer() ||
+                         len != (size_t) n_embd * hparams.n_layer())) {
+        LLAMA_LOG_ERROR("%s: zero-based control vector requires every model layer\n", __func__);
+        return false;
+    }
+
     if (tensors.empty()) {
         if (!init(model)) {
             return false;
@@ -123,10 +134,13 @@ bool llama_adapter_cvec::apply(
     layer_start = il_start;
     layer_end   = il_end;
 
-    for (size_t il = 1; il < hparams.n_layer(); il++) {
+    for (size_t il = 0; il < hparams.n_layer(); il++) {
         assert(tensors[il] != nullptr);
 
-        const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
+        if (il == 0 && il_start != 0) {
+            continue;
+        }
+        const size_t off = (size_t) n_embd * (il_start == 0 ? il : il - 1);
         if (off + n_embd <= len) {
             ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
         }

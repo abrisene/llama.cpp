@@ -2668,3 +2668,15 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+### Request activation edits (private fork)
+
+Text `/completion` and `/v1/chat/completions` requests accept `activation_edits`, for example:
+
+```json
+{"prompt":"Hello", "n_predict":16, "activation_edits":[{"layer":0,"neuron":7,"add":2.5}]}
+```
+
+Each entry adds a finite float to one post-block residual channel at every prompt and generated token. `layer` and `neuron` are zero-based; `/v1/models` model `meta.n_layer` and `meta.n_embd` give their exclusive upper bounds. Duplicate pairs, malformed values, out-of-range indices, and layers without a residual insertion point return HTTP 400. An empty list uses the ordinary baseline. Dense directions use one entry per channel.
+
+The existing control-vector mechanism applies the edits additively with any startup control vectors. Requests with identical edits may batch together; different edits use separate decode batches. Edits are restored after each decode, including failure or cancellation. Edited requests bypass prompt and persistent-prefix caches and clear their slot state on release, so the next plain request sees the baseline. Text requests with speculative decoding or multimodal input, and other task types, do not support activation edits and return HTTP 400 when edits are present.

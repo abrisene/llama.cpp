@@ -16,6 +16,7 @@
 
 struct llama_adapter_cvec {
     ggml_tensor * tensor_for(int il) const;
+    bool supports_layer(int il, int32_t width) const;
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
 
@@ -37,6 +38,7 @@ private:
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     std::vector<ggml_tensor *> tensors; // per layer
+    mutable std::unordered_map<int, int64_t> layer_widths;
 };
 
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;

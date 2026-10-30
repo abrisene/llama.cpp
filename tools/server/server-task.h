@@ -97,6 +97,8 @@ struct task_params {
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
+    std::map<std::pair<int32_t, int32_t>, float> activation_edits;
+
     std::map<int, float> lora; // mapping adapter ID -> scale
     std::vector<request_lora_ref> lora_refs; // path-based entries, resolved to ids by launch_slot_with_task
 

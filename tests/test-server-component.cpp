@@ -740,6 +740,36 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_activation_edits(testing & t) {
+    const common_params base{};
+    const auto eval = [&](const json & edits) {
+        return server_schema::eval_llama_cmpl_schema(nullptr, base, {}, {{"activation_edits", edits}});
+    };
+    const auto parsed = eval(json::array({{{"layer", 0}, {"neuron", 7}, {"add", -2.5}},
+                                          {{"layer", 8}, {"neuron", 0}, {"add", 3}}}));
+    t.assert_equal("two edits", (size_t) 2, parsed.activation_edits.size());
+    t.assert_equal("first layer", -2.5f, parsed.activation_edits.at({0, 7}));
+    t.assert_true("cold request", !parsed.cache_prompt && parsed.n_cache_reuse == 0);
+    t.assert_true("empty baseline", eval(json::array()).activation_edits.empty());
+    for (const auto & invalid : std::vector<json>{
+            nullptr, json::object(),
+            json::array({{{"layer", -1}, {"neuron", 0}, {"add", 1}}}),
+            json::array({{{"layer", 0.5}, {"neuron", 0}, {"add", 1}}}),
+            json::array({{{"layer", 0}, {"neuron", 2147483648LL}, {"add", 1}}}),
+            json::array({{{"layer", 0}, {"neuron", 0}, {"add", 1e100}}}),
+            json::array({{{"layer", 0}, {"neuron", 0}, {"add", "1"}}}),
+            json::array({{{"layer", 0}, {"neuron", 0}, {"add", 1}},
+                         {{"layer", 0}, {"neuron", 0}, {"add", 2}}})}) {
+        bool rejected = false;
+        try {
+            eval(invalid);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        t.assert_true("invalid edit rejected: " + invalid.dump(), rejected);
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -752,6 +782,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("activation_edits", test_activation_edits);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);

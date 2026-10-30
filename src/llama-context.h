@@ -146,6 +146,8 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
+    bool supports_adapter_cvec(int32_t layer) const;
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,

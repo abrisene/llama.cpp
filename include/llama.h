@@ -786,6 +786,7 @@ extern "C" {
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point
     // to an n_embd x n_layers buffer starting from layer 1.
+    // With il_start == 0, data starts at layer 0 and includes all layers.
     // il_start and il_end are the layer range the vector should apply to (both inclusive)
     // See llama_control_vector_load in common to load a control vector.
     LLAMA_API int32_t llama_set_adapter_cvec(
@@ -795,6 +796,9 @@ extern "C" {
                          int32_t   n_embd,
                          int32_t   il_start,
                          int32_t   il_end);
+
+    // Whether the context graph exposes this residual layer with the model's width.
+    LLAMA_API bool llama_supports_adapter_cvec(struct llama_context * ctx, int32_t layer);
 
     //
     // Memory

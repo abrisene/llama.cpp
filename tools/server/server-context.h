@@ -55,6 +55,7 @@ struct server_context_meta {
     int32_t model_vocab_n_tokens;
     int32_t model_n_ctx_train;
     int32_t model_n_embd_inp;
+    int32_t model_n_layer;
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;

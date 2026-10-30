@@ -7556,6 +7556,12 @@ static json get_res_model_info(const server_context_meta & meta) {
             {"n_ctx_train", meta.model_n_ctx_train},
             {"n_embd",      meta.model_n_embd_inp},
             {"n_layer",     meta.model_n_layer},
+            {"activation_edit_dimensions", {
+                {"layers", meta.model_n_layer},
+                {"neurons", meta.model_n_embd_inp},
+                {"position", "post_block_residual"},
+                {"index_base", 0},
+            }},
             {"n_params",    meta.model_n_params},
             {"size",        meta.model_size},
             {"ftype",       meta.model_ftype},

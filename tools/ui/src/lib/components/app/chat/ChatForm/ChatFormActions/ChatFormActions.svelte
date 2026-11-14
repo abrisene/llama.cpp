@@ -15,7 +15,15 @@
 	import { useChatFormModel } from '$lib/hooks/use-chat-form-model.svelte';
 	import { useShowContextGauge } from '$lib/hooks/use-context-gauge.svelte';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, deviceStore, modelsStore, serverStore, settingsStore, toolsStore } from '$lib/stores';
+	import {
+		chatStore,
+		conversationsStore,
+		deviceStore,
+		modelsStore,
+		serverStore,
+		settingsStore,
+		toolsStore
+	} from '$lib/stores';
 	import { abbreviateWorkingDir, getFileTypeCategory } from '$lib/utils';
 
 	interface Props {

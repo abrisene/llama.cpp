@@ -870,8 +870,7 @@ const searchChatsDefaultDisabledMigration: Migration = {
 };
 const SYSTEM_PROMPT_PROFILES_MIGRATION_ID = 'system-prompt-profiles-v1';
 const systemPromptProfilesMigration: Migration = {
-	description:
-		'Migrate the single systemMessage config string into a named systemPrompts profile',
+	description: 'Migrate the single systemMessage config string into a named systemPrompts profile',
 	id: SYSTEM_PROMPT_PROFILES_MIGRATION_ID,
 
 	async run(): Promise<void> {
@@ -920,7 +919,9 @@ const systemPromptProfilesMigration: Migration = {
 		// Non-destructive: DO NOT delete the legacy systemMessage key - kept as the
 		// downgrade-compat fallback getApiOptions() already reads when no profile is set.
 		if (import.meta.env.DEV && import.meta.env.VITE_DEBUG)
-			console.log('[Migration] System prompts: created "Default" profile from legacy systemMessage');
+			console.log(
+				'[Migration] System prompts: created "Default" profile from legacy systemMessage'
+			);
 	}
 };
 const migrations: Migration[] = [

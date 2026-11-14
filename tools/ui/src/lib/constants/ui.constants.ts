@@ -5,7 +5,12 @@ import {
 	SHORTCUT_SEARCH,
 	SHORTCUT_SETTINGS
 } from './keyboard-shortcuts.constants';
-import { MCP_SERVERS_ROUTE_ID, MODELS_ROUTE_ID, ROUTES, SETTINGS_ROUTE_ID } from './routes.constants';
+import {
+	MCP_SERVERS_ROUTE_ID,
+	MODELS_ROUTE_ID,
+	ROUTES,
+	SETTINGS_ROUTE_ID
+} from './routes.constants';
 import { Layers, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';

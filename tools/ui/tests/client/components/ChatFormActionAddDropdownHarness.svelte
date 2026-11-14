@@ -28,6 +28,9 @@
 		get hasVisionModality() {
 			return false;
 		},
+		get workingDirectoryLabel() {
+			return '';
+		},
 		get onPrecachePrefix() {
 			return onPrecachePrefix;
 		},

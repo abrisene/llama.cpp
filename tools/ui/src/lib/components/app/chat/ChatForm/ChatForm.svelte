@@ -91,10 +91,7 @@
 		// Event Handlers
 		onAttachmentRemove?: (index: number) => void;
 		onFilesAdd?: (files: File[]) => void;
-		onPrecachePrefix?: (draft: {
-			message: string;
-			files: ChatUploadedFile[];
-		}) => Promise<void>;
+		onPrecachePrefix?: (draft: { message: string; files: ChatUploadedFile[] }) => Promise<void>;
 		onStop?: () => void;
 		onSubmit?: () => void;
 		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
